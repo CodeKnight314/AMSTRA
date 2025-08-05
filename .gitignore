@@ -1,0 +1,4 @@
+.DS_Store
+model/yolov8m.pt
+model/yolov8n.pt
+model/yolov8s.pt
