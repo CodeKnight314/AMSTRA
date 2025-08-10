@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 import numpy as np
 from typing import List, Tuple, Union
+import torch
 
 
 class YoloDetection:
@@ -32,7 +33,11 @@ class YoloDetection:
             image = image[:, :, :3]
         image = image[:, :, ::-1]
 
-        results = self.model.predict(image, verbose=False, conf=self.conf_threshold)[0]
+        self.model.eval()
+        with torch.no_grad():
+            results = self.model.predict(
+                image, verbose=False, conf=self.conf_threshold
+            )[0]
 
         detections = []
         for box in results.boxes:
