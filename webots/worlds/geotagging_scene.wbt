@@ -160,8 +160,8 @@ Mavic2Pro {
   ]
   cameraSlot [
     Camera {
-      width 400
-      height 240
+      width 640
+      height 480
       near 0.2
     }
   ]
