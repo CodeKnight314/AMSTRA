@@ -14,11 +14,9 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/trees/protos/Pine.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/trees/protos/Forest.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/dji/mavic/protos/Mavic2Pro.proto"
+IMPORTABLE EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/vehicles/protos/tesla/TeslaModel3.proto"
 
 WorldInfo {
-  info [
-    
-  ]
   title "GeoTag World"
   basicTimeStep 8
   defaultDamping Damping {
@@ -27,8 +25,8 @@ WorldInfo {
   }
 }
 Viewpoint {
-  orientation -0.019998666293386428 -0.00019999332942266784 0.9997999866719112 3.1615886535898277
-  position -12.483873759673596 0.8950792721126366 1.7879313750172847
+  orientation 0.13887035953725788 -0.027838649277330894 -0.9899192052124287 3.533390903875495
+  position 3.2741742615033687 -1.0043354722765452 1.270965829252265
   near 0.2
   follow "floor"
   followSmoothness 0.2
@@ -150,20 +148,16 @@ Forest {
 }
 Mavic2Pro {
   hidden position_0_0 2.756808211354146e-09
-  hidden linearVelocity_0 -0.06450188576508921 0.03341331836273578 -0.015756270188647732
-  hidden angularVelocity_0 -1.7520224166411047e-06 -3.4037062400503187e-06 0.00015325603787386236
   hidden position_5_0 -4.0401679263118693e-07
-  hidden linearVelocity_5 -0.06450751301555835 0.03339469019992567 -0.015756748818085663
-  hidden angularVelocity_5 -1.752083125496985e-06 -3.4036736676324943e-06 0.0001532697455288117
   hidden rotation_6 0 -1 0 4.042583693936634e-07
   hidden position_6_0 -2.3314386283734058e-08
-  hidden linearVelocity_6 -0.06450660795333304 0.03339477157527364 -0.015756736760818554
-  hidden angularVelocity_6 -1.7785773989120977e-06 -3.5177827560649676e-06 0.00015326989465170028
   hidden rotation_7 -1 0 0 2.9802322387695313e-08
-  hidden linearVelocity_7 -0.0645053700827294 0.03339434412808648 -0.01575673239950486
-  hidden angularVelocity_7 -1.813062789947996e-06 -3.5097727877276885e-06 0.00015326971782633045
-  translation -6.540143095740367 2.57030542507581 10.353655199305104
-  rotation -0.0024245225612515324 0.0009225737091452489 0.9999966352683898 2.9134165030496324
+  translation 0.11749423792539126 -0.04435094671193354 0.08572277462326783
+  rotation 0.03484599216163668 0.0005781388788130822 0.9993925267809981 -3.1084920784021
+  controller "geotagging_controller"
+  controllerArgs [
+    ""
+  ]
   cameraSlot [
     Camera {
       width 400
@@ -171,4 +165,10 @@ Mavic2Pro {
       near 0.2
     }
   ]
+}
+Robot {
+  rotation 0 1 0 0
+  name "WorldSpawner"
+  controller "spawner"
+  supervisor TRUE
 }
