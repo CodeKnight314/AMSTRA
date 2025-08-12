@@ -28,7 +28,8 @@ Viewpoint {
   orientation 0.13887035953725788 -0.027838649277330894 -0.9899192052124287 3.533390903875495
   position 3.2741742615033687 -1.0043354722765452 1.270965829252265
   near 0.2
-  follow "floor"
+  follow "Mavic 2 PRO"
+  followType "Mounted Shot"
   followSmoothness 0.2
 }
 TexturedBackground {
@@ -154,7 +155,7 @@ Mavic2Pro {
   hidden rotation_7 -1 0 0 2.9802322387695313e-08
   translation 0.11749423792539126 -0.04435094671193354 0.08572277462326783
   rotation 0.03484599216163668 0.0005781388788130822 0.9993925267809981 -3.1084920784021
-  controller "geotagging_controller"
+  controller "mavic2pro_geotag"
   controllerArgs [
     ""
   ]
