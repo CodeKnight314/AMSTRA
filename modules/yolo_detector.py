@@ -1,17 +1,16 @@
 from ultralytics import YOLO
 import numpy as np
 from typing import List, Tuple, Union
-import torch
 
 
 class YoloDetection:
     def __init__(
         self,
-        model_name: str = "models/yolov8m.pt",
+        model_name: str = "models/yolov8s.pt",
         device: str = "cpu",
-        conf_threshold: float = 0.3,
+        conf_threshold: float = 0.9,
     ):
-        self.model = YOLO(model_name).to(device)
+        self.model = YOLO(model_name, task="detect")
         self.device = device
         self.conf_threshold = conf_threshold
 
@@ -33,11 +32,12 @@ class YoloDetection:
             image = image[:, :, :3]
         image = image[:, :, ::-1]
 
-        self.model.eval()
-        with torch.no_grad():
-            results = self.model.predict(
-                image, verbose=False, conf=self.conf_threshold
-            )[0]
+        results = self.model.predict(
+            image,
+            verbose=False,
+            conf=self.conf_threshold,
+            device=self.device,
+        )[0]
 
         detections = []
         for box in results.boxes:
