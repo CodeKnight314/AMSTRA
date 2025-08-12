@@ -1,9 +1,10 @@
 import torch
 import numpy as np
+import time
 
 
 class MiDasEstimation:
-    def __init__(self, model_name: str, device: str):
+    def __init__(self, model_name: str = "MiDaS_small", device: str = "cpu"):
         self.model = torch.hub.load("intel-isl/MiDaS", model_name).to(device)
         self.device = device
         self.model.eval()
@@ -41,3 +42,14 @@ class MiDasEstimation:
 
     def __call__(self, image: np.ndarray):
         return self.infer(image)
+
+
+if __name__ == "__main__":
+    HEIGHT = 480
+    WIDTH = 640
+    image = np.random.rand(HEIGHT, WIDTH, 3)
+    model = MiDasEstimation(model_name="MiDaS_small", device="cpu")
+    start = time.time()
+    output = model(image)
+    end = time.time() - start
+    print("runtime", end)
