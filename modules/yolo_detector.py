@@ -17,7 +17,7 @@ class YoloDetection:
     def infer(
         self,
         image: np.ndarray,
-        return_boxes: bool = False,
+        return_boxes: bool = True,
     ) -> Union[
         List[Tuple[str, float, Tuple[int, int]]],
         List[Tuple[str, float, Tuple[int, int], np.ndarray]],
@@ -57,5 +57,5 @@ class YoloDetection:
 
         return detections
 
-    def __call__(self, image: np.ndarray, return_boxes: bool = False):
+    def __call__(self, image: np.ndarray, return_boxes: bool = True):
         return self.infer(image, return_boxes)
