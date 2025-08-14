@@ -1,4 +1,6 @@
 import socket
+import psutil
+import csv
 import struct
 import threading
 import json
@@ -6,54 +8,20 @@ from utils import *
 from config import *
 import numpy as np
 import cv2
-from typing import Tuple
-from skimage.metrics import structural_similarity as ssim
 from yolo_detector import YoloDetection
 from midas_depth_estimation import MiDasEstimation
+from sort_tracking import SORTTrackManager
 import argparse
 import os
 import logging
 from datetime import datetime
+import time
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    filename=f"log_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
-HOST = "127.0.0.1"
-PORT = 5001
-BACKLOG = 4
-
-
-def img_postprocess(image: np.array, dim: Tuple[int, int] = (64, 36)):
-    resized = cv2.resize(image, dim, interpolation=cv2.INTER_AREA)
-    grayscale = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    return grayscale
-
-
-def mean_abs_diff(curr: np.array, ref: np.array):
-    if curr.shape != ref.shape:
-        raise ValueError(
-            f"Current array does not match reference array in shape. Expected {ref.shape} from current array but got {curr.shape}"
-        )
-    c = curr.astype(np.float32) / 255.0
-    r = ref.astype(np.float32) / 255.0
-    return float(np.mean(np.abs(c - r)))
-
-
-def hist_diff(curr: np.array, ref: np.array):
-    cur_hist = cv2.calcHist([curr], [0], None, [64], [0, 255])
-    ref_hist = cv2.calcHist([ref], [0], None, [64], [0, 255])
-    cur_hist = cv2.normalize(cur_hist, None, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
-    ref_hist = cv2.normalize(ref_hist, None, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
-    return float(cv2.compareHist(cur_hist, ref_hist, cv2.HISTCMP_CHISQR))
-
-
-def ssim_diff(curr: np.ndarray, ref: np.ndarray) -> float:
-    c = curr.astype(np.float32) / 255.0
-    r = ref.astype(np.float32) / 255.0
-    dr = float(max(1e-6, c.max() - c.min(), r.max() - r.min()))
-    score, _ = ssim(c, r, full=True, data_range=dr)
-    return float(score)
 
 
 def motion_gate(
@@ -65,8 +33,8 @@ def motion_gate(
     early_exit: bool = True,
 ) -> bool:
 
-    curr_gs = img_postprocess(curr)
-    prev_gs = img_postprocess(prev)
+    curr_gs = img_preprocess(curr)
+    prev_gs = img_preprocess(prev)
 
     m = mean_abs_diff(curr_gs, prev_gs)
 
@@ -113,6 +81,8 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
     logging.info("YoloV8 model instantiated")
     midas = MiDasEstimation()
     logging.info("MiDaS model instantiated")
+    sort_manager = SORTTrackManager()
+    logging.info("SORT manager instantiated")
 
     prev_frame = None
     frame_count = 0
@@ -120,30 +90,74 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
     now = datetime.now()
     time_str = now.strftime("%H_%M_%S")
     json_path = os.path.join(output_path, f"stream_{time_str}.json")
-    all_results = []
+    cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
+
+    process = psutil.Process(os.getpid())
+    process.cpu_percent(interval=None)
+
+    with open(json_path, "w") as f:
+        f.write("[\n")
+
+    with open(cpu_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "timestamp",
+                "yolo_pct_all",
+                "depth_pct_all",
+                "yolo_pct_machine",
+                "depth_pct_machine",
+                "yolo_cores",
+                "depth_cores",
+            ]
+        )
+
+    first_entry = True
+
+    start_timestamp = time.time()
 
     try:
         while True:
-            logging.info(f"Attempting to retrieve frame")
             curr_frame = recv_frame(conn)
-            logging.info(f"Successfully retrieved frame")
 
             if prev_frame is None:
                 prev_frame = curr_frame
                 motion = True
             else:
                 motion = motion_gate(curr_frame, prev_frame)
-            logging.info(f"Motion Detected: {motion}")
-            if motion:
-                detection_results = yolo(curr_frame, return_boxes=True)
-                depth_map = midas(curr_frame)
 
-                for obj in detection_results:
+            if motion:
+                logging.info(f"Motion detected from camera feed")
+                y_results, y_dt, y_pct_all, y_pct_machine, y_cores = measure_cpu_usage(
+                    process, yolo, curr_frame
+                )
+
+                d_results, d_dt, d_pct_all, d_pct_machine, d_cores = measure_cpu_usage(
+                    process, midas, curr_frame
+                )
+
+                timestamp_cpu = time.time() - start_timestamp
+                with open(cpu_csv_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            timestamp_cpu,
+                            y_pct_all,
+                            d_pct_all,
+                            y_pct_machine,
+                            d_pct_machine,
+                            y_cores,
+                            d_cores,
+                        ]
+                    )
+
+                detection_results = []
+                for obj in y_results:
                     x, y = map(int, obj[2])
-                    h, w = depth_map.shape[:2]
+                    h, w = d_results.shape[:2]
                     x = np.clip(x, 0, w - 1)
                     y = np.clip(y, 0, h - 1)
-                    z = float(depth_map[y, x])
+                    z = float(d_results[y, x])
 
                     payload = {
                         "frame_idx": int(frame_count),
@@ -151,21 +165,35 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
                         "conf": float(obj[1]),
                         "center": np.asarray(obj[2]).tolist(),
                         "bbox": np.asarray(obj[3]).tolist(),
-                        "depth_value": float(z),
+                        "rel_depth_value": float(z),
+                        "ts_detect": y_dt,
+                        "ts_depth": d_dt,
                     }
 
-                    all_results.append(payload)
+                    detection_results.append(payload)
 
-                with open(json_path, "w") as f:
-                    json.dump(all_results, f, indent=4)
+                outputs = sort_manager.step(detection_results, frame_count)
+                print(len(outputs))
+
+                for output in outputs:
+                    with open(json_path, "a") as f:
+                        if not first_entry:
+                            f.write(",\n")
+                        json.dump(output, f, indent=4)
+                        first_entry = False
 
             frame_count += 1
             prev_frame = curr_frame
 
     except Exception as e:
+        import traceback
+
+        traceback.print_exc()
         logging.error(f"An error occurred: {e}")
 
     finally:
+        with open(json_path, "a") as f:
+            f.write("\n]")
         conn.close()
         logging.info(f"[-] Disconnected: {addr}")
 
