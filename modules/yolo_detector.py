@@ -6,7 +6,7 @@ from typing import List, Tuple, Union
 class YoloDetection:
     def __init__(
         self,
-        model_name: str = "models/yolov8s.pt",
+        model_name: str = "models/yolov8m.pt",
         device: str = "cpu",
         conf_threshold: float = 0.9,
     ):
