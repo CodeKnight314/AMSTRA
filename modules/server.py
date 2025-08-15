@@ -16,6 +16,7 @@ import os
 import logging
 from datetime import datetime
 import time
+from typing import List, Dict
 
 logging.basicConfig(
     filename=f"log_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.txt",
@@ -76,6 +77,9 @@ def recv_frame(sock: socket.socket) -> np.ndarray:
 
 def process_stream(output_path: str, conn: socket.socket, addr: str):
     logging.info(f"[+] Connected: {addr}")
+    now = datetime.now()
+    time_str = now.strftime("%H_%M_%S")
+    output_path = os.path.join(output_path, time_str)
     os.makedirs(output_path, exist_ok=True)
     yolo = YoloDetection(conf_threshold=CONF)
     logging.info("YoloV8 model instantiated")
@@ -86,11 +90,13 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
 
     prev_frame = None
     frame_count = 0
-
-    now = datetime.now()
-    time_str = now.strftime("%H_%M_%S")
     json_path = os.path.join(output_path, f"stream_{time_str}.json")
     cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(
+        os.path.join(output_path, f"stream_{time_str}.mp4"), fourcc, FPS, (640, 480)
+    )
+    logging.info("Video Writer instantiated")
 
     process = psutil.Process(os.getpid())
     process.cpu_percent(interval=None)
@@ -117,6 +123,7 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
     start_timestamp = time.time()
 
     try:
+        outputs = []
         while True:
             curr_frame = recv_frame(conn)
 
@@ -126,7 +133,9 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
             else:
                 motion = motion_gate(curr_frame, prev_frame)
 
-            if motion:
+            if not motion:
+                outputs = sort_manager.step([], frame_count)
+            else:
                 logging.info(f"Motion detected from camera feed")
                 y_results, y_dt, y_pct_all, y_pct_machine, y_cores = measure_cpu_usage(
                     process, yolo, curr_frame
@@ -173,14 +182,15 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
                     detection_results.append(payload)
 
                 outputs = sort_manager.step(detection_results, frame_count)
-                print(len(outputs))
 
-                for output in outputs:
-                    with open(json_path, "a") as f:
-                        if not first_entry:
-                            f.write(",\n")
-                        json.dump(output, f, indent=4)
-                        first_entry = False
+            for output in outputs:
+                with open(json_path, "a") as f:
+                    if not first_entry:
+                        f.write(",\n")
+                    json.dump(output, f, indent=4)
+                    first_entry = False
+
+            out.write(curr_frame)
 
             frame_count += 1
             prev_frame = curr_frame
@@ -194,6 +204,7 @@ def process_stream(output_path: str, conn: socket.socket, addr: str):
     finally:
         with open(json_path, "a") as f:
             f.write("\n]")
+        out.release()
         conn.close()
         logging.info(f"[-] Disconnected: {addr}")
 
