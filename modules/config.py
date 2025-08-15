@@ -14,3 +14,5 @@ PORT = 5001
 BACKLOG = 4
 
 N_LOGICAL = psutil.cpu_count(logical=True) or 1
+
+FPS = 60
