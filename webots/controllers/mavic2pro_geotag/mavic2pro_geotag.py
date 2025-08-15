@@ -97,6 +97,8 @@ try:
 except Exception:
     camera_yaw_motor = None
 
+initial_roll, initial_pitch, _ = imu.getRollPitchYaw()
+
 front_left_motor = robot.getDevice("front left propeller")
 front_right_motor = robot.getDevice("front right propeller")
 rear_left_motor = robot.getDevice("rear left propeller")
@@ -180,9 +182,9 @@ while robot.step(timestep) != -1:
     key = keyboard.getKey()
     while key != -1:
         if key in (ord("W"), ord("w")):
-            pitch_disturbance = -3.0
+            pitch_disturbance = -2.0
         elif key in (ord("S"), ord("s")):
-            pitch_disturbance = 3.0
+            pitch_disturbance = 2.0
         elif key in (ord("A"), ord("a")):
             roll_disturbance = 1.0
         elif key in (ord("D"), ord("d")):
@@ -217,8 +219,12 @@ while robot.step(timestep) != -1:
 
         key = keyboard.getKey()
 
-    roll_input = k_roll_p * clamp(roll, -1.0, 1.0) + gx + roll_disturbance
-    pitch_input = k_pitch_p * clamp(pitch, -1.0, 1.0) + gy + pitch_disturbance
+    pitch_input = (
+        k_pitch_p * clamp(pitch - initial_pitch, -1.0, 1.0) + gy + pitch_disturbance
+    )
+    roll_input = (
+        k_roll_p * clamp(roll - initial_roll, -1.0, 1.0) + gx + roll_disturbance
+    )
     yaw_input = yaw_disturbance
 
     clamped_diff_alt = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
@@ -241,5 +247,3 @@ while robot.step(timestep) != -1:
     front_right_motor.setVelocity(-front_right_motor_input)
     rear_left_motor.setVelocity(-rear_left_motor_input)
     rear_right_motor.setVelocity(rear_right_motor_input)
-
-cv2.destroyAllWindows()
