@@ -102,8 +102,11 @@ def iou(bbox_1: np.ndarray, bbox_2: np.ndarray):
 
     total_area = (x12 - x11) * (y12 - y11) + (x22 - x21) * (y22 - y21) - inter_area
 
+    if total_area <= 0:
+        return 0.0
+    
     iou = inter_area / total_area
-    return iou
+    return max(0.0, min(1.0, iou))
 
 
 class Track:
@@ -164,7 +167,7 @@ class Track:
 
 
 class SORTTrackManager:
-    def __init__(self, max_age: int = 10, min_age: int = 3, iou_threshold: float = 0.3):
+    def __init__(self, max_age: int = 5, min_age: int = 1, iou_threshold: float = 0.3):
         self.max_age = max_age
         self.min_age = min_age
         self.iou_threshold = iou_threshold
@@ -189,8 +192,7 @@ class SORTTrackManager:
         if not detections:
             for track in self.tracks:
                 prediction = track.predict(frame_idx)
-                if track.hit_streak >= self.min_age:
-                    output.append(prediction)
+                output.append(prediction)
             self.tracks = [
                 t for t in self.tracks if t.time_since_update <= self.max_age
             ]
