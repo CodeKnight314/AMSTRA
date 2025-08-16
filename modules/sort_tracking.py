@@ -72,7 +72,10 @@ def bbox_to_measurement(bbox: np.ndarray):
 
 def state_to_bbox(state: np.ndarray):
     u, v, s, r = float(state[0]), float(state[1]), float(state[2]), float(state[3])
-    w = math.sqrt(r * s)
+    val = r * s
+    if val <= 0:
+        val = 1e-6
+    w = math.sqrt(val)
     h = s / w
     x1 = u - w / 2
     x2 = u + w / 2
@@ -104,7 +107,7 @@ def iou(bbox_1: np.ndarray, bbox_2: np.ndarray):
 
     if total_area <= 0:
         return 0.0
-    
+
     iou = inter_area / total_area
     return max(0.0, min(1.0, iou))
 
@@ -136,7 +139,7 @@ class Track:
                 "center": (u, v),
                 "bbox": bbox_pred,
                 "conf": None,
-                "depth_value": None,
+                "rel_depth_value": None,
                 "ts_detect": None,
                 "ts_depth": None,
             }
