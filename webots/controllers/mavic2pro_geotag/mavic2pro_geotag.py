@@ -2,46 +2,54 @@ import cv2
 from controller import Robot, Keyboard
 from math import pow
 import numpy as np
-import struct, socket, time
+import struct, socket, time, threading
+from queue import Queue, Full, Empty
 
 
 class FrameClient:
-    def __init__(self, host: str, port: int, timeout: float, jpeg_quality: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        jpeg_quality: int,
+        max_queue: int = 8,
+        drop_policy: str = "drop_oldest",
+    ):
+        assert 0 <= jpeg_quality <= 100
+        assert drop_policy in ("drop_oldest", "drop_newest")
         self.address = (host, port)
         self.timeout = timeout
-        assert (
-            jpeg_quality >= 0 and jpeg_quality <= 100
-        ), "JPEG Quality must be between 0 and 100."
         self.quality = jpeg_quality
+        self.q = Queue(maxsize=max_queue)
+        self.drop_policy = drop_policy
+        self._stop = threading.Event()
         self.sock = None
         self._connect()
 
+        self._tx = threading.Thread(target=self._tx_loop, daemon=True)
+        self._tx.start()
+
     def send_frame(self, bgr: np.ndarray):
-        ok, enc = cv2.imencode(
-            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-        )
-        if not ok:
-            return
-        data = enc.tobytes()
-        if len(data) == 0 or len(data) > 50_000_000:
-            return
-        header = struct.pack("!I", len(data))
-        try:
-            self.sock.sendall(header)
-            self.sock.sendall(data)
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        while True:
             try:
-                print(
-                    "Restarting connection due to BrokenPipeError, ConnecetionResetError, OSError or other Exception"
-                )
-                time.sleep(0.25)
-                self._connect()
-                self.sock.sendall(header)
-                self.sock.sendall(data)
-            except Exception:
-                pass
+                self.q.put_nowait(bgr)
+                break
+            except Full:
+                if self.drop_policy == "drop_oldest":
+                    try:
+                        self.q.get_nowait()
+                    except Empty:
+                        pass
+                else:
+                    return
 
     def close(self):
+        self._stop.set()
+        try:
+            self.q.put_nowait(None)
+        except Full:
+            pass
         try:
             if self.sock:
                 self.sock.close()
@@ -60,6 +68,34 @@ class FrameClient:
         s.settimeout(None)
         self.sock = s
         print(f"[client] connected to {self.address[0]}:{self.address[1]}")
+
+    def _tx_loop(self):
+        while not self._stop.is_set():
+            item = self.q.get()
+            if item is None:
+                break
+            bgr = item
+            ok, enc = cv2.imencode(
+                ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+            )
+            if not ok:
+                continue
+            data = enc.tobytes()
+            if len(data) == 0 or len(data) > 50_000_000:
+                continue
+            header = struct.pack("!I", len(data))
+            try:
+                self.sock.sendall(header)
+                self.sock.sendall(data)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                try:
+                    print("TX error → reconnecting…")
+                    time.sleep(0.25)
+                    self._connect()
+                    self.sock.sendall(header)
+                    self.sock.sendall(data)
+                except Exception:
+                    pass
 
 
 def clamp(value: float, low: float, high: float) -> float:
