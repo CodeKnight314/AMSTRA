@@ -1,2 +1,8 @@
 .DS_Store
 models/*
+modules/__pycache__/yolo_detector.cpython-312.pyc
+modules/__pycache__/utils.cpython-312.pyc
+modules/__pycache__/sort_tracking.cpython-312.pyc
+modules/__pycache__/midas_depth_estimation.cpython-312.pyc
+modules/__pycache__/config.cpython-312.pyc
+modules/__pycache__/triangulation.cpython-312.pyc
