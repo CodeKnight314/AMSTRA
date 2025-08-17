@@ -11,6 +11,7 @@ import cv2
 from yolo_detector import YoloDetectionMain
 from midas_depth_estimation import MiDasEstimation
 from sort_tracking import SORTTrackManager
+from triangulation import TriangulationModule
 import argparse
 import os
 import logging
@@ -18,9 +19,9 @@ from datetime import datetime
 import time
 import queue
 from threading import Thread
+from typing import List
 
 logging.basicConfig(
-    filename=f"log_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.txt",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
@@ -47,9 +48,7 @@ def motion_gate(
     h = hist_diff(curr_gs, prev_gs)
     s = ssim_diff(curr_gs, prev_gs)
 
-    is_motion = (
-        (m >= threshold_mean) or (h >= threshold_hist) or (s <= threshold_ssim)
-    )
+    is_motion = (m >= threshold_mean) or (h >= threshold_hist) or (s <= threshold_ssim)
     return is_motion
 
 
@@ -76,352 +75,280 @@ def recv_frame(sock: socket.socket) -> np.ndarray:
     return img
 
 
-def process_stream_sync(output_path: str, conn: socket.socket, addr: str):
-    logging.info(f"[+] Connected: {addr}")
-    now = datetime.now()
-    time_str = now.strftime("%H_%M_%S")
-    output_path = os.path.join(output_path, time_str)
-    os.makedirs(output_path, exist_ok=True)
-    yolo = YoloDetectionMain(conf_threshold=CONF)
-    logging.info("YoloV8 model instantiated")
-    midas = MiDasEstimation()
-    logging.info("MiDaS model instantiated")
-    sort_manager = SORTTrackManager()
-    logging.info("SORT manager instantiated")
-
-    prev_frame = None
-    frame_count = 0
-    json_path = os.path.join(output_path, f"stream_{time_str}.json")
-    cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(
-        os.path.join(output_path, f"stream_{time_str}.mp4"), fourcc, FPS, (640, 480)
-    )
-    logging.info("Video Writer instantiated")
-
-    process = psutil.Process(os.getpid())
-    process.cpu_percent(interval=None)
-
-    with open(json_path, "w") as f:
-        f.write("[\n")
-
-    with open(cpu_csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "timestamp",
-                "yolo_pct_all",
-                "depth_pct_all",
-                "yolo_pct_machine",
-                "depth_pct_machine",
-                "yolo_cores",
-                "depth_cores",
-            ]
-        )
-
-    first_entry = True
-
-    start_timestamp = time.time()
-
-    try:
-        outputs = []
-        while True:
-            curr_frame = recv_frame(conn)
-
-            if prev_frame is None:
-                prev_frame = curr_frame
-                motion = True
-            else:
-                motion = motion_gate(curr_frame, prev_frame)
-
-            if not motion:
-                outputs = sort_manager.step([], frame_count)
-            else:
-                logging.info(f"Motion detected from camera feed")
-                y_results, y_dt, y_pct_all, y_pct_machine, y_cores = measure_cpu_usage(
-                    process, yolo, curr_frame
-                )
-
-                d_results, d_dt, d_pct_all, d_pct_machine, d_cores = measure_cpu_usage(
-                    process, midas, curr_frame
-                )
-
-                timestamp_cpu = time.time() - start_timestamp
-                with open(cpu_csv_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(
-                        [
-                            timestamp_cpu,
-                            y_pct_all,
-                            d_pct_all,
-                            y_pct_machine,
-                            d_pct_machine,
-                            y_cores,
-                            d_cores,
-                        ]
-                    )
-
-                detection_results = []
-                for obj in y_results:
-                    x, y = map(int, obj[2])
-                    h, w = d_results.shape[:2]
-                    x = np.clip(x, 0, w - 1)
-                    y = np.clip(y, 0, h - 1)
-                    z = float(d_results[y, x])
-
-                    payload = {
-                        "frame_idx": int(frame_count),
-                        "class_name": str(obj[0]),
-                        "conf": float(obj[1]),
-                        "center": np.asarray(obj[2]).tolist(),
-                        "bbox": np.asarray(obj[3]).tolist(),
-                        "rel_depth_value": float(z),
-                        "ts_detect": y_dt,
-                        "ts_depth": d_dt,
-                    }
-
-                    detection_results.append(payload)
-                print("Detection Result Length: ", len(detection_results))
-                outputs = sort_manager.step(detection_results, frame_count)
-                print("SORT Manager Output Length: ", len(outputs))
-
-            for output in outputs:
-                with open(json_path, "a") as f:
-                    if not first_entry:
-                        f.write(",\n")
-                    json.dump(output, f, indent=4)
-                    first_entry = False
-
-                x1, y1, x2, y2 = map(int, output["bbox"])
-                track_id = output["track_id"]
-                class_name = output["class_name"]
-
-                cv2.rectangle(curr_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                label = f"{class_name} ID:{track_id}"
-                (label_w, label_h), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                )
-                cv2.rectangle(
-                    curr_frame,
-                    (x1, y1 - label_h - baseline),
-                    (x1 + label_w, y1),
-                    (0, 255, 0),
-                    -1,
-                )
-
-                cv2.putText(
-                    curr_frame,
-                    label,
-                    (x1, y1 - baseline),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-            out.write(curr_frame)
-
-            frame_count += 1
-            prev_frame = curr_frame
-
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        logging.error(f"An error occurred: {e}")
-
-    finally:
-        with open(json_path, "a") as f:
-            f.write("\n]")
-        out.release()
-
-        conn.close()
-        logging.info(f"[-] Disconnected: {addr}")
+def recv_metadata(sock: socket.socket) -> List[np.ndarray]:
+    header = recv_exact(sock, 4)
+    (length,) = struct.unpack("!I", header)
+    if length == 0 or length > 50_000_000:
+        raise ValueError(f"Bad frame length: {length}")
+    payload = recv_exact(sock, length)
+    metadata = json.loads(payload.decode("utf-8"))
+    if metadata is None:
+        raise ValueError("Failed to decode metadata")
+    K = np.array(metadata["K"]).reshape(3, 3)
+    R = np.array(metadata["R"]).reshape(3, 3)
+    T = np.array(metadata["T"]).reshape(3, 1)
+    metadata = {"K": K, "R": R, "T": T}
+    return metadata
 
 
 def process_stream_async(output_path: str, conn: socket.socket, addr: str):
-    logging.info(f"[+] Connected: {addr}")
-    now = datetime.now()
-    time_str = now.strftime("%H_%M_%S")
-    output_path = os.path.join(output_path, time_str)
-    os.makedirs(output_path, exist_ok=True)
+    try:
+        logging.info(f"[+] Connected: {addr}")
+        now = datetime.now()
+        time_str = now.strftime("%H_%M_%S")
+        output_path = os.path.join(output_path, time_str)
+        os.makedirs(output_path, exist_ok=True)
 
-    yolo = YoloDetectionMain(conf_threshold=CONF)
-    logging.info("YoloV8 model instantiated")
-    midas = MiDasEstimation()
-    logging.info("MiDaS model instantiated")
-    sort_manager = SORTTrackManager()
-    logging.info("SORT manager instantiated")
+        yolo = YoloDetectionMain(conf_threshold=CONF)
+        logging.info("YoloV8 model instantiated")
+        midas = MiDasEstimation()
+        logging.info("MiDaS model instantiated")
+        sort_manager = SORTTrackManager()
+        logging.info("SORT manager instantiated")
+        tri_module = TriangulationModule(k=np.ones((3, 3)))
+        logging.info("Triangulation module instantiated")
 
-    json_path = os.path.join(output_path, f"stream_{time_str}.json")
-    cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(
-        os.path.join(output_path, f"stream_{time_str}.mp4"), fourcc, FPS, (640, 480)
-    )
-    logging.info("Video Writer instantiated")
-
-    process = psutil.Process(os.getpid())
-    process.cpu_percent(interval=None)
-
-    with open(json_path, "w") as f:
-        f.write("[\n")
-    with open(cpu_csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "timestamp",
-                "yolo_pct_all",
-                "depth_pct_all",
-                "yolo_pct_machine",
-                "depth_pct_machine",
-                "yolo_cores",
-                "depth_cores",
-            ]
+        json_path = os.path.join(output_path, f"stream_{time_str}.json")
+        cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(
+            os.path.join(output_path, f"stream_{time_str}.mp4"), fourcc, FPS, (640, 480)
         )
+        logging.info("Video Writer instantiated")
 
-    start_timestamp = time.time()
-    first_entry = True
+        process = psutil.Process(os.getpid())
+        process.cpu_percent(interval=None)
 
-    q = queue.Queue(maxsize=8)
-    stop_sentinel = object()
+        with open(json_path, "w") as f:
+            f.write("[\n")
+        with open(cpu_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "timestamp",
+                    "yolo_pct_all",
+                    "yolo_pct_machine",
+                    "yolo_cores",
+                ]
+            )
 
-    def recv_loop():
-        frame_idx = 0
-        try:
-            while True: 
-                frame = recv_frame(conn)
-                ts = time.time()
-                item = (frame_idx, frame, ts)
-                while True:
-                    try:
-                        q.put(item, timeout=0.1)
-                        break
-                    except queue.Full:
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            pass
-                frame_idx += 1
-        except Exception as e:
-            logging.info(f"recv_loop ending: {e}")
-        finally:
+        start_timestamp = time.time()
+        first_entry = True
+
+        q = queue.Queue(maxsize=1e6)
+        stop_sentinel = object()
+
+        def recv_loop():
+            frame_idx = 0
             try:
-                q.put_nowait((None, stop_sentinel, None))
-            except Exception:
-                pass
+                while True:
+                    frame = recv_frame(conn)
+                    metadata = recv_metadata(conn)
+                    ts = time.time()
+                    item = (frame_idx, frame, metadata, ts)
+                    while True:
+                        try:
+                            q.put(item, timeout=0.1)
+                            break
+                        except queue.Full:
+                            try:
+                                q.get_nowait()
+                            except queue.Empty:
+                                pass
+                    frame_idx += 1
+            except Exception as e:
+                logging.info(f"recv_loop ending: {e}")
+            finally:
+                try:
+                    q.put_nowait((None, stop_sentinel, None, None))
+                except Exception:
+                    pass
 
-    def worker_loop():
-        nonlocal first_entry
-        prev_frame = None
-        outputs = []
-        while True:
-            idx, frame, ts = q.get()
-            if frame is stop_sentinel:
-                break
+        def worker_loop():
+            nonlocal first_entry
+            prev_frame = None
+            prev_R = None
+            prev_t = None
+            outputs = []
 
-            force_detection = (idx % 10 == 0)
-            motion = True if prev_frame is None else (force_detection or motion_gate(frame, prev_frame))
+            processing_times = {
+                "motion_gate": {"total": 0, "count": 0},
+                "yolo_detection": {"total": 0, "count": 0},
+                "midas_estimation": {"total": 0, "count": 0},
+                "sort_tracking": {"total": 0, "count": 0},
+                "drawing_on_frame": {"total": 0, "count": 0},
+                "triangulation": {"total": 0, "count": 0},
+            }
 
-            if not motion:
-                outputs = sort_manager.step([], idx)
-            else:
-                y_results, y_dt, y_pct_all, y_pct_machine, y_cores = measure_cpu_usage(
-                    process, yolo, frame
+            def update_time(name, start):
+                duration = time.time() - start
+                processing_times[name]["total"] += duration
+                processing_times[name]["count"] += 1
+
+            while True:
+                logging.info(f"Total Frames remaining to process: {q.qsize()}")
+                idx, frame, metadata, ts = q.get()
+
+                if frame is stop_sentinel:
+                    logging.info("End of queue reached. Exiting worker thread.")
+                    break
+
+                force_detection = idx % 10 == 0
+
+                start_time = time.time()
+                motion = (
+                    True
+                    if prev_frame is None
+                    else (force_detection or motion_gate(frame, prev_frame))
                 )
-                d_results, d_dt, d_pct_all, d_pct_machine, d_cores = measure_cpu_usage(
-                    process, midas, frame
-                )
+                update_time("motion_gate", start_time)
 
-                timestamp_cpu = ts - start_timestamp
-                with open(cpu_csv_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(
-                        [
-                            timestamp_cpu,
-                            y_pct_all,
-                            d_pct_all,
-                            y_pct_machine,
-                            d_pct_machine,
-                            y_cores,
-                            d_cores,
-                        ]
+                if not motion:
+                    start_time = time.time()
+                    outputs = sort_manager.step([], idx)
+                    update_time("sort_tracking", start_time)
+                else:
+                    start_time = time.time()
+                    y_results, y_dt, y_pct_all, y_pct_machine, y_cores = (
+                        measure_cpu_usage(process, yolo, frame)
+                    )
+                    update_time("yolo_detection", start_time)
+
+                    timestamp_cpu = ts - start_timestamp
+                    with open(cpu_csv_path, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                timestamp_cpu,
+                                y_pct_all,
+                                y_pct_machine,
+                                y_cores,
+                            ]
+                        )
+
+                    detection_results = []
+                    for obj in y_results:
+                        payload = {
+                            "frame_idx": int(idx),
+                            "class_name": str(obj[0]),
+                            "conf": float(obj[1]),
+                            "center": np.asarray(obj[2]).tolist(),
+                            "bbox": np.asarray(obj[3]).tolist(),
+                            "ts_detect": y_dt,
+                        }
+                        detection_results.append(payload)
+
+                    start_time = time.time()
+                    outputs = sort_manager.step(detection_results, idx)
+                    update_time("sort_tracking", start_time)
+
+                start_time = time.time()
+                tri_module.update(metadata["K"])
+
+                points3d = {i: [] for i in range(len(outputs))}
+                if prev_frame is not None and prev_R is not None and prev_t is not None:
+                    bboxes = [output["bbox"] for output in outputs]
+                    points3d = tri_module(
+                        prev_frame,
+                        prev_R,
+                        prev_t,
+                        frame,
+                        metadata["R"],
+                        metadata["T"],
+                        bboxes,
+                    )
+                update_time("triangulation", start_time)
+
+                prev_frame = frame
+                prev_R = metadata["R"]
+                prev_t = metadata["T"]
+
+                start_time = time.time()
+                for i, output in enumerate(outputs):
+                    with open(json_path, "a") as f:
+                        if not first_entry:
+                            f.write(",\n")
+                        json.dump(output, f, indent=4)
+                        first_entry = False
+
+                    x1, y1, x2, y2 = map(int, output["bbox"])
+                    track_id = output["track_id"]
+                    class_name = output["class_name"]
+                    if class_name not in CLASS_FILTER:
+                        continue
+                    color = (0, 255, 0)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+                    label = f"{class_name} ID:{track_id} Predict: {output['kalman']}"
+                    coords_label = ""
+                    pts = points3d.get(i, [])
+                    if len(pts) > 0:
+                        coords_3d = np.mean(pts, axis=0)
+                        coords_label = f"3D: {coords_3d[0]:.2f}, {coords_3d[1]:.2f}, {coords_3d[2]:.2f}"
+
+                    (label_w, label_h), baseline = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                    )
+                    (coords_w, coords_h), baseline2 = cv2.getTextSize(
+                        coords_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                    )
+                    total_h = label_h + coords_h + baseline + baseline2
+                    total_w = max(label_w, coords_w)
+
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1 - total_h),
+                        (x1 + total_w, y1),
+                        color,
+                        -1,
                     )
 
-                detection_results = []
-                h, w = d_results.shape[:2]
-                for obj in y_results:
-                    x, y = map(int, obj[2])
-                    x = np.clip(x, 0, w - 1)
-                    y = np.clip(y, 0, h - 1)
-                    z = float(d_results[y, x])
-                    payload = {
-                        "frame_idx": int(idx),
-                        "class_name": str(obj[0]),
-                        "conf": float(obj[1]),
-                        "center": np.asarray(obj[2]).tolist(),
-                        "bbox": np.asarray(obj[3]).tolist(),
-                        "rel_depth_value": z,
-                        "ts_detect": y_dt,
-                        "ts_depth": d_dt,
-                    }
-                    detection_results.append(payload)
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y1 - coords_h - baseline2),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    if coords_label:
+                        cv2.putText(
+                            frame,
+                            coords_label,
+                            (x1, y1 - baseline2),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 0, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                update_time("drawing_on_frame", start_time)
 
-                outputs = sort_manager.step(detection_results, idx)
+                out.write(frame)
 
-            for output in outputs:
-                with open(json_path, "a") as f:
-                    if not first_entry:
-                        f.write(",\n")
-                    json.dump(output, f, indent=4)
-                    first_entry = False
+            out.release()
+            logging.info("Video writer released in worker_loop")
+            print("Average processing times:")
+            for name, data in processing_times.items():
+                if data["count"] > 0:
+                    avg_time = data["total"] / data["count"]
+                    print(f"{name}: {avg_time:.4f}s")
 
-                x1, y1, x2, y2 = map(int, output["bbox"])
-                track_id = output["track_id"]
-                class_name = output["class_name"]
+        recv_t = Thread(target=recv_loop, daemon=True)
+        work_t = Thread(target=worker_loop, daemon=True)
+        recv_t.start()
+        work_t.start()
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    except Exception as e:
+        logging.error(f"Stream crashed: {e}")
 
-                label = f"{class_name} ID:{track_id}"
-                (label_w, label_h), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                )
-                cv2.rectangle(
-                    frame,
-                    (x1, y1 - label_h - baseline),
-                    (x1 + label_w, y1),
-                    (0, 255, 0),
-                    -1,
-                )
-
-                cv2.putText(
-                    frame,
-                    label,
-                    (x1, y1 - baseline),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-            print(len(outputs))
-            out.write(frame)
-
-            prev_frame = frame
-
-    recv_t = Thread(target=recv_loop, daemon=True)
-    work_t = Thread(target=worker_loop, daemon=True)
-    recv_t.start()
-    work_t.start()
-    work_t.join()
-
-    try:
+    finally:
+        work_t.join()
         with open(json_path, "a") as f:
             f.write("\n]")
-    finally:
-        out.release()
         conn.close()
         logging.info(f"[-] Disconnected: {addr}")
 
