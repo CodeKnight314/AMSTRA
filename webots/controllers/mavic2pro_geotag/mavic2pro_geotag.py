@@ -4,6 +4,18 @@ from math import pow
 import numpy as np
 import struct, socket, time, threading
 from queue import Queue, Full, Empty
+import random
+import math
+import json
+
+
+def get_camera_intrinsic(height: float, width: float, fov: float):
+    cx = (width - 1) / 2
+    cy = (height - 1) / 2
+    fx = width / (2 * math.tan(fov / 2))
+    fy = fx
+    matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+    return matrix
 
 
 class FrameClient:
@@ -13,7 +25,7 @@ class FrameClient:
         port: int,
         timeout: float,
         jpeg_quality: int,
-        max_queue: int = 8,
+        max_queue: int = 100,
         drop_policy: str = "drop_oldest",
     ):
         assert 0 <= jpeg_quality <= 100
@@ -30,10 +42,11 @@ class FrameClient:
         self._tx = threading.Thread(target=self._tx_loop, daemon=True)
         self._tx.start()
 
-    def send_frame(self, bgr: np.ndarray):
+    def send_frame(self, bgr: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray):
         while True:
             try:
-                self.q.put_nowait(bgr)
+                batch = (bgr, K, R, t)
+                self.q.put_nowait(batch)
                 break
             except Full:
                 if self.drop_policy == "drop_oldest":
@@ -71,10 +84,11 @@ class FrameClient:
 
     def _tx_loop(self):
         while not self._stop.is_set():
+            transmission_delay()
             item = self.q.get()
             if item is None:
                 break
-            bgr = item
+            bgr, k, r, t = item
             ok, enc = cv2.imencode(
                 ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
             )
@@ -97,9 +111,36 @@ class FrameClient:
                 except Exception:
                     pass
 
+            metadata = {
+                "K": k.flatten().tolist(),
+                "R": r.flatten().tolist(),
+                "T": t.flatten().tolist(),
+            }
+
+            meta_bytes = json.dumps(metadata).encode("utf-8")
+            meta_header = struct.pack("!I", len(meta_bytes))
+            try:
+                self.sock.sendall(meta_header)
+                self.sock.sendall(meta_bytes)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                try:
+                    print("TX error → reconnecting...")
+                    time.sleep(1)
+                    self._connect()
+                    self.sock.sendall(meta_header)
+                    self.sock.sendall(meta_bytes)
+                except Exception:
+                    pass
+
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def transmission_delay(min_ms: int = 15, max_ms: int = 25):
+    sleep_duration_ms = random.randint(min_ms, max_ms)
+    sleep_duration_sec = sleep_duration_ms / 1000
+    time.sleep(sleep_duration_sec)
 
 
 robot = Robot()
@@ -186,8 +227,8 @@ target_altitude = 1.0
 
 cam_pitch_offset = 0.0
 cam_yaw_offset = 0.0
-cam_pitch_step = 0.02
-cam_yaw_step = 0.03
+cam_pitch_step = 0.005
+cam_yaw_step = 0.005
 cam_pitch_limit = 0.5
 cam_yaw_limit = 1.6
 
@@ -200,7 +241,56 @@ while robot.step(timestep) != -1:
 
     frame_bgr = camera_frame_bgr()
     if frame_bgr is not None:
-        sender.send_frame(frame_bgr)
+        pos = gps.getValues()
+        t = np.array(pos).reshape(
+            3,
+        )
+
+        R_cam_yaw = np.array(
+            [
+                [np.cos(cam_yaw_offset), -np.sin(cam_yaw_offset), 0],
+                [np.sin(cam_yaw_offset), np.cos(cam_yaw_offset), 0],
+                [0, 0, 1],
+            ]
+        )
+
+        R_cam_pitch = np.array(
+            [
+                [np.cos(cam_pitch_offset), 0, np.sin(cam_pitch_offset)],
+                [0, 1, 0],
+                [-np.sin(cam_pitch_offset), 0, np.cos(cam_pitch_offset)],
+            ]
+        )
+
+        R_cam = R_cam_yaw @ R_cam_pitch
+
+        roll, pitch, yaw = imu.getRollPitchYaw()
+        Rz = np.array(
+            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
+        )
+        Ry = np.array(
+            [
+                [np.cos(pitch), 0, np.sin(pitch)],
+                [0, 1, 0],
+                [-np.sin(pitch), 0, np.cos(pitch)],
+            ]
+        )
+        Rx = np.array(
+            [
+                [1, 0, 0],
+                [0, np.cos(roll), -np.sin(roll)],
+                [0, np.sin(roll), np.cos(roll)],
+            ]
+        )
+        R = Rz @ Ry @ Rx @ R_cam
+
+        fov = camera.getFov()
+        width = camera.getWidth()
+        height = camera.getHeight()
+
+        K = get_camera_intrinsic(height, width, fov)
+
+        sender.send_frame(frame_bgr, K, R, t)
 
     led_state = int(now) % 2
     front_left_led.set(led_state)
