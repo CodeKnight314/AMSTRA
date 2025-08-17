@@ -32,32 +32,6 @@ def img_preprocess(image: np.array, dim: Tuple[int, int] = (64, 36)) -> np.ndarr
     return grayscale
 
 
-def feature_match(kp1, des1, kp2, des2, K):
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    matches = sorted(matches, key=lambda x: x.distance)
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-
-    E, mask = cv2.findEssentialMat(
-        pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
-    )
-
-    pts1 = pts1[mask.ravel() == 1]
-    pts2 = pts2[mask.ravel() == 1]
-
-    return pts1, pts2
-
-
-def nomralize(pts: np.ndarray, K: np.ndarray) -> np.ndarray:
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-
-    x = (pts[:, 0] - cx) / fx
-    y = (pts[:, 1] - cy) / fy
-    return np.hstack([x, y], axis=1)
-
-
 def mean_abs_diff(curr: np.array, ref: np.array):
     if curr.shape != ref.shape:
         raise ValueError(
@@ -117,28 +91,3 @@ def get_camera_extrinsic(rotation: np.array, translation: np.array):
     T[:3, :3] = R
     T[:3, 3] = translation
     return T
-
-
-def get_object_wc(
-    coord: np.array,
-    depth: np.array,
-    intrinsic_matrix: np.array,
-    extrinsic_matrix: np.array,
-):
-    N = coord.shape[0]
-    if coord.shape != (N, 2):
-        raise ValueError()
-    if depth.shape != (N, 1):
-        raise ValueError()
-    if intrinsic_matrix.shape != (3, 3):
-        raise ValueError()
-    if extrinsic_matrix.shape != (4, 4):
-        raise ValueError()
-
-    homog_coord = np.hstack([coord, np.ones((coord.shape[0], 1))])
-    camera_coords = (np.linalg.inv(intrinsic_matrix) @ homog_coord.T) * depth.T
-    world_coords = extrinsic_matrix @ np.vstack(
-        [camera_coords, np.ones((1, coord.shape[0]))]
-    )
-    world_coords = world_coords[:3, :].T
-    return world_coords
