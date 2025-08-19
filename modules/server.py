@@ -20,6 +20,7 @@ import time
 import queue
 from threading import Thread
 from typing import List
+from collections import deque
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,9 +167,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
 
         def worker_loop():
             nonlocal first_entry
-            prev_frame = None
-            prev_R = None
-            prev_t = None
+            frame_buffer = deque(maxlen=100)
             outputs = []
 
             processing_times = {
@@ -198,8 +197,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 start_time = time.time()
                 motion = (
                     True
-                    if prev_frame is None
-                    else (force_detection or motion_gate(frame, prev_frame))
+                    if not frame_buffer
+                    else (force_detection or motion_gate(frame, frame_buffer[-1][0]))
                 )
                 update_time("motion_gate", start_time)
 
@@ -242,26 +241,29 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     outputs = sort_manager.step(detection_results, idx)
                     update_time("sort_tracking", start_time)
 
+                frame_buffer.append(
+                    (frame, metadata["K"], metadata["R"], metadata["T"])
+                )
+
                 start_time = time.time()
                 tri_module.update(metadata["K"])
 
                 points3d = {i: [] for i in range(len(outputs))}
-                if prev_frame is not None and prev_R is not None and prev_t is not None:
+                if len(frame_buffer) >= 10:
+                    oldest_frame, _, oldest_R, oldest_t = frame_buffer[0]
+                    newest_frame, _, newest_R, newest_t = frame_buffer[-1]
+
                     bboxes = [output["bbox"] for output in outputs]
                     points3d = tri_module(
-                        prev_frame,
-                        prev_R,
-                        prev_t,
-                        frame,
-                        metadata["R"],
-                        metadata["T"],
+                        oldest_frame,
+                        oldest_R,
+                        oldest_t,
+                        newest_frame,
+                        newest_R,
+                        newest_t,
                         bboxes,
                     )
                 update_time("triangulation", start_time)
-
-                prev_frame = frame
-                prev_R = metadata["R"]
-                prev_t = metadata["T"]
 
                 start_time = time.time()
                 for i, output in enumerate(outputs):
