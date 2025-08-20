@@ -11,7 +11,7 @@ import cv2
 from yolo_detector import YoloDetectionMain
 from midas_depth_estimation import MiDasEstimation
 from sort_tracking import SORTTrackManager
-from triangulation import TriangulationModule
+from triangulation import TriangulationBAModule
 import argparse
 import os
 import logging
@@ -106,7 +106,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         logging.info("MiDaS model instantiated")
         sort_manager = SORTTrackManager()
         logging.info("SORT manager instantiated")
-        tri_module = TriangulationModule(k=np.ones((3, 3)))
+        tri_module = TriangulationBAModule(maxlen=100)
         logging.info("Triangulation module instantiated")
 
         json_path = os.path.join(output_path, f"stream_{time_str}.json")
@@ -169,6 +169,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
             nonlocal first_entry
             frame_buffer = deque(maxlen=100)
             outputs = []
+            initialize = False
 
             processing_times = {
                 "motion_gate": {"total": 0, "count": 0},
@@ -188,6 +189,11 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 logging.info(f"Total Frames remaining to process: {q.qsize()}")
                 idx, frame, metadata, ts = q.get()
 
+                points3d = {i: [] for i in range(len(outputs))}
+                if len(tri_module) > TRI_MIN_SIZE and not initialize:
+                    tri_module.initialize_3D_points()
+                    initialize = True
+
                 if frame is stop_sentinel:
                     logging.info("End of queue reached. Exiting worker thread.")
                     break
@@ -206,6 +212,17 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     start_time = time.time()
                     outputs = sort_manager.step([], idx)
                     update_time("sort_tracking", start_time)
+
+                    start_time = time.time()
+                    bboxes = [output["bbox"] for output in outputs]
+                    tri_module.insert(
+                        metadata["K"],
+                        frame,
+                        metadata["R"],
+                        metadata["T"],
+                        bboxes,
+                    )
+                    update_time("triangulation", start_time)
                 else:
                     start_time = time.time()
                     y_results, y_dt, y_pct_all, y_pct_machine, y_cores = (
@@ -241,29 +258,29 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     outputs = sort_manager.step(detection_results, idx)
                     update_time("sort_tracking", start_time)
 
+                    if initialize:
+                        start_time = time.time()
+                        bboxes = [output["bbox"] for output in outputs]
+                        tri_module.insert(
+                            metadata["K"],
+                            frame,
+                            metadata["R"],
+                            metadata["T"],
+                            bboxes,
+                        )
+                        points3d = tri_module.infer(
+                            metadata["K"],
+                            frame,
+                            metadata["R"],
+                            metadata["T"],
+                            bboxes,
+                            do_ba=force_detection,
+                        )
+                        update_time("triangulation", start_time)
+
                 frame_buffer.append(
                     (frame, metadata["K"], metadata["R"], metadata["T"])
                 )
-
-                start_time = time.time()
-                tri_module.update(metadata["K"])
-
-                points3d = {i: [] for i in range(len(outputs))}
-                if len(frame_buffer) >= 10:
-                    oldest_frame, _, oldest_R, oldest_t = frame_buffer[0]
-                    newest_frame, _, newest_R, newest_t = frame_buffer[-1]
-
-                    bboxes = [output["bbox"] for output in outputs]
-                    points3d = tri_module(
-                        oldest_frame,
-                        oldest_R,
-                        oldest_t,
-                        newest_frame,
-                        newest_R,
-                        newest_t,
-                        bboxes,
-                    )
-                update_time("triangulation", start_time)
 
                 start_time = time.time()
                 for i, output in enumerate(outputs):
@@ -376,7 +393,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulated Ground Station Server")
     parser.add_argument(
-        "--o", type=str, required=True, help="Output directory for json files"
+        "--o", type=str, default="server_output", help="Output directory for json files"
     )
 
     args = parser.parse_args()
