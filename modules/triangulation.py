@@ -209,7 +209,15 @@ class TriangulationNewModule:
                 pts2 = np.array([[u2, v2]], dtype=np.float32)
                 X = self._triangulate_two_views(pts1, pts2, f1, f2)[0]
 
-                self.points3D[-1] = X
+                mask = self._filter(f1, f2, X)
+
+                pts1 = pts1[mask]
+                pts2 = pts2[mask]
+                X = X[mask]
+
+                if mask[0]:
+                    self.tracks.append(new_track)
+                    self.points3D.append(X[0])
 
     def initialize_3D_points(self):
         while len(self.points3D) < len(self.tracks):
@@ -231,7 +239,11 @@ class TriangulationNewModule:
                     pts1 = np.array([track[frame_indices[j]]], dtype=np.float32)
                     pts2 = np.array([track[frame_indices[k]]], dtype=np.float32)
 
-                    X = self._triangulate_two_views(pts1, pts2, f1, f2)[0]
+                    X = self._triangulate_two_views(pts1, pts2, f1, f2)
+                    mask = self._filter(f1, f2, X)
+
+                    if not mask.any():
+                        continue
 
                     c1 = -f1["R"].T @ f1["t"]
                     c2 = -f2["R"].T @ f2["t"]
@@ -239,7 +251,7 @@ class TriangulationNewModule:
 
                     if dist > best_dist:
                         best_dist = dist
-                        best_X = X
+                        best_X = X[mask][0]
 
             if best_X is not None:
                 self.points3D[i] = best_X
@@ -300,3 +312,27 @@ class TriangulationNewModule:
             return results
         else:
             return None
+
+    def _cheirality(self, f1, f2, X):
+        X = X.reshape(-1, 3)
+        z1 = (f1["R"] @ X.T + f1["t"]).T[:, 2]
+        z2 = (f2["R"] @ X.T + f2["t"]).T[:, 2]
+        valid_cheirality = (z1 > 0) & (z2 > 0)
+        return valid_cheirality
+
+    def _parallax(self, f1, f2, X):
+        c1 = -f1["R"].T @ f1["t"]
+        c2 = -f2["R"].T @ f2["t"]
+        r1 = X - c1.reshape(1, 3)
+        r2 = X - c2.reshape(1, 3)
+
+        cosang = np.sum(r1 * r2, axis=1) / (
+            np.linalg.norm(r1, axis=1) * np.linalg.norm(r2, axis=1) + 1e-12
+        )
+
+        angles = np.degrees(np.arccos(np.clip(cosang, -1, 1)))
+        valid_parallax = angles > 1.0
+        return valid_parallax
+
+    def _filter(self, f1, f2, X):
+        return self._cheirality(f1, f2, X) & self._parallax(f1, f2, X)
