@@ -5,7 +5,7 @@ from collections import deque
 from scipy.optimize import least_squares
 
 
-class TriangulationModule:
+class TriangulationF2FModule:
     def __init__(self, k: np.ndarray):
         self.k = k
         self.orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
@@ -81,8 +81,8 @@ class TriangulationModule:
         return False
 
 
-class TriangulationNewModule:
-    def __init__(self, maxlen: int = 100):
+class TriangulationBAModule:
+    def __init__(self, maxlen: int = 1000):
         self.orb = cv2.ORB_create(nfeatures=512, scaleFactor=1.2, nlevels=8)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self._buffer = deque(maxlen=maxlen)
@@ -104,14 +104,17 @@ class TriangulationNewModule:
         h, w = shape
         mask = np.zeros((h, w), dtype=np.uint8)
         for i, (x1, y1, x2, y2) in enumerate(bboxes):
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(x2, w), min(y2, h)
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            x1 = max(0, min(x1, w - 1))
+            x2 = max(0, min(x2, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            y2 = max(0, min(y2, h - 1))
 
             if x2 > x1 and y2 > y1:
                 mask[y1 : y2 + 1, x1 : x2 + 1] = 255
         return mask
 
-    def insert_buffer(
+    def insert(
         self,
         K: np.ndarray,
         frame: np.ndarray,
@@ -207,8 +210,7 @@ class TriangulationNewModule:
                 f1, f2 = self._buffer[idx1], self._buffer[idx2]
                 pts1 = np.array([[u1, v1]], dtype=np.float32)
                 pts2 = np.array([[u2, v2]], dtype=np.float32)
-                X = self._triangulate_two_views(pts1, pts2, f1, f2)[0]
-
+                X = self._triangulate_two_views(pts1, pts2, f1, f2)
                 mask = self._filter(f1, f2, X)
 
                 pts1 = pts1[mask]
@@ -269,23 +271,33 @@ class TriangulationNewModule:
                 proj = K @ (R @ Xi.reshape(3, 1) + t)
                 u, v = proj[0] / proj[2], proj[1] / proj[2]
                 residuals.extend([u - uv[0], v - uv[1]])
-        return np.array(residuals)
+        return np.array(residuals).flatten()
 
     def run_bundle_adjustment(self):
         if not self.points3D:
             raise ValueError("No 3D points to refine. Run initialize_points() first.")
-        X0 = np.array(self.points3D).reshape(-1, 3)
-        result = least_squares(self._reprojection_residuals, X0.ravel(), verbose=2)
-        refined = result.x.reshape(-1, 3)
-        self.points3D = refined
-        return refined
 
-    def project(self, K: np.ndarray, R: np.ndarray, t: np.ndarray):
+        # Mix of nones and arrays in self.points3d -> optimize the not none points and preserve order
+        targets = []
+        idxes = []
+        for i, elm in enumerate(self.points3D):
+            if elm is not None:
+                idxes.append(i)
+                targets.append(elm)
+
+        X0 = np.array(targets).reshape(-1, 3)
+        result = least_squares(self._reprojection_residuals, X0.ravel(), verbose=2)
+        refined = result.x.reshape(-1, 3).tolist()
+        for i in range(len(refined)):
+            self.points3D[idxes[i]] = refined[i]
+        return self.points3D
+
+    def project(self, K: np.ndarray, R: np.ndarray, t: np.ndarray, pts_3d):
         P = K @ np.hstack((R, t))
-        pts_3d = np.array(self.points3D)
-        pts_h = np.hstack((pts_3d, np.ones((pts_3d.shape[0], 1))))
+        pts_h = np.hstack((pts_3d, np.ones((1))))
 
         pts_2d = (P @ pts_h.T).T
+        pts_2d = pts_2d.reshape(-1, 3)
         pts_2d = pts_2d[:, :2] / pts_2d[:, 2, np.newaxis]
         return pts_2d
 
@@ -298,13 +310,15 @@ class TriangulationNewModule:
         bboxes: List[Tuple[int]] = None,
         do_ba: bool = False,
     ):
-        self.insert_buffer(K, frame, R, t, bboxes)
         if do_ba:
             pts_3d = self.run_bundle_adjustment()
-            pts_2d = self.project(K, R, t)
 
             results = {j: [] for j in range(len(bboxes))}
-            for pt2d, pt3d in zip(pts_2d, pts_3d):
+            for pt3d in pts_3d:
+                if pt3d is None:
+                    continue
+
+                pt2d = self.project(K, R, t, np.array(pt3d)).tolist()[0]
                 for j, bbox in enumerate(bboxes):
                     if self._is_in_bbox(pt2d, [bbox]):
                         results[j].append(pt3d)
@@ -336,3 +350,6 @@ class TriangulationNewModule:
 
     def _filter(self, f1, f2, X):
         return self._cheirality(f1, f2, X) & self._parallax(f1, f2, X)
+
+    def __len__(self):
+        return len(self._buffer)
