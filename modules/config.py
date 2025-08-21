@@ -17,4 +17,4 @@ N_LOGICAL = psutil.cpu_count(logical=True) or 1
 
 CLASS_FILTER = ["person", "car", "truck", "bus", "motorcycle", "bicycle", "animal"]
 
-TRI_MIN_SIZE = 50
+TRI_MIN_SIZE = 100
