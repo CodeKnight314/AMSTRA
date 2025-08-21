@@ -9,9 +9,8 @@ from config import *
 import numpy as np
 import cv2
 from yolo_detector import YoloDetectionMain
-from midas_depth_estimation import MiDasEstimation
 from sort_tracking import SORTTrackManager
-from triangulation import TriangulationBAModule, TriangulationF2FModule
+from triangulation import TriangulationBAModule
 import argparse
 import os
 import logging
@@ -21,6 +20,7 @@ import queue
 from threading import Thread
 from typing import List
 from collections import deque
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,6 +110,12 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         cvdata_json_path = os.path.join(output_path, f"stream_{time_str}_cv.json")
         label_mp4_path = os.path.join(output_path, f"stream_{time_str}_labeled.mp4")
         raw_mp4_path = os.path.join(output_path, f"stream_{time_str}_raw.mp4")
+        trajectory_mp4_path = os.path.join(
+            output_path, f"stream_{time_str}_trajectory.mp4"
+        )
+        sidebyside_mp4_path = os.path.join(
+            output_path, f"stream_{time_str}_sidebyside.mp4"
+        )
 
         process = psutil.Process(os.getpid())
         process.cpu_percent(interval=None)
@@ -161,6 +167,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     pass
 
         def worker_loop():
+            firstNavEntry = True
+            firstOutputEntry = True
             frame_buffer = deque(maxlen=100)
             outputs = []
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -256,7 +264,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 )
 
                 with open(cvdata_json_path, "a") as f:
-                    f.write(",\n")
+                    if not firstNavEntry:
+                        f.write(",\n")
                     json.dump(
                         {
                             "frame_idx": idx,
@@ -270,12 +279,15 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                         f,
                         indent=4,
                     )
+                    firstNavEntry = False
 
                 start_time = time.time()
                 for i, output in enumerate(outputs):
                     with open(json_path, "a") as f:
-                        f.write(",\n")
+                        if not firstOutputEntry:
+                            f.write(",\n")
                         json.dump(output, f, indent=4)
+                        firstOutputEntry = False
 
                     x1, y1, x2, y2 = map(int, output["bbox"])
                     track_id = output["track_id"]
@@ -342,31 +354,35 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     avg_time = data["total"] / data["count"]
                     print(f"{name}: {avg_time:.4f}s")
 
-        def postprocess_loop(cvdata_json_path, raw_mp4_path):
+        def postprocess_loop(cv_path, mp4_path):
+            logging.info("Starting Postprocessing...")
             tri_ba_module = TriangulationBAModule(maxlen=TRI_MIN_SIZE)
             logging.info("Triangulation Bundle Adjustment Module initialized.")
 
-            with open(cvdata_json_path, "r") as f:
+            points3d_json_path = os.path.join(output_path, f"stream_{time_str}_points3d.json")
+            firstOutputEntry = True
+            with open(points3d_json_path, "w") as f:
+                f.write("[\n")
+
+            with open(cv_path, "r") as f:
                 cv_data = json.load(f)
 
-            cap = cv2.VideoCapture(raw_mp4_path)
+            cap = cv2.VideoCapture(mp4_path)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if not cap.isOpened():
                 logging.error("Could not open video file.")
                 return
 
             frame_idx = 0
             initialized = False
-            while True:
+            for frame_idx in tqdm(range(total_frames), desc="Processing frames", leave=False):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                frame_data = next(
-                    (item for item in cv_data if item.get("frame_idx") == frame_idx),
-                    None,
-                )
+
+                frame_data = cv_data[frame_idx]["data"]
                 if not frame_data:
                     logging.warning(f"No CV data found for frame {frame_idx}")
-                    frame_idx += 1
                     continue
 
                 tri_ba_module.insert(
@@ -377,7 +393,45 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     frame_data["bboxes"],
                 )
 
-                frame_idx += 1
+                if initialized and frame_idx % 50 == 0:
+                    logging.info(f"Inference Triggered at Frame Idx: {frame_idx}")
+                    points3d = tri_ba_module.infer(
+                        np.array(frame_data["K"]),
+                        frame,
+                        np.array(frame_data["R"]),
+                        np.array(frame_data["t"]),
+                        frame_data["bboxes"],
+                        do_ba=True,
+                    )
+
+                    with open(points3d_json_path, "a") as f:
+                        if not firstOutputEntry:
+                            f.write(",\n")
+                        json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
+                        firstOutputEntry = False
+
+                if len(tri_ba_module) == TRI_MIN_SIZE and not initialized:
+                    logging.info("Initializing_3D_points")
+                    tri_ba_module.initialize_3D_points()
+                    initialized = True
+                    points3d = tri_ba_module.infer(
+                        np.array(frame_data["K"]),
+                        frame,
+                        np.array(frame_data["R"]),
+                        np.array(frame_data["t"]),
+                        frame_data["bboxes"],
+                        do_ba=True,
+                    )
+
+                    with open(points3d_json_path, "a") as f:
+                        if not firstOutputEntry:
+                            f.write(",\n")
+                        json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
+                        firstOutputEntry = False
+
+            with open(points3d_json_path, "a") as f:
+                f.write("\n]")
+
 
         recv_t = Thread(target=recv_loop, daemon=True)
         work_t = Thread(target=worker_loop, daemon=True)
