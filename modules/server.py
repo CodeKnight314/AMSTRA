@@ -342,6 +342,43 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     avg_time = data["total"] / data["count"]
                     print(f"{name}: {avg_time:.4f}s")
 
+        def postprocess_loop(cvdata_json_path, raw_mp4_path):
+            tri_ba_module = TriangulationBAModule(maxlen=TRI_MIN_SIZE)
+            logging.info("Triangulation Bundle Adjustment Module initialized.")
+
+            with open(cvdata_json_path, "r") as f:
+                cv_data = json.load(f)
+
+            cap = cv2.VideoCapture(raw_mp4_path)
+            if not cap.isOpened():
+                logging.error("Could not open video file.")
+                return
+
+            frame_idx = 0
+            initialized = False
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_data = next(
+                    (item for item in cv_data if item.get("frame_idx") == frame_idx),
+                    None,
+                )
+                if not frame_data:
+                    logging.warning(f"No CV data found for frame {frame_idx}")
+                    frame_idx += 1
+                    continue
+
+                tri_ba_module.insert(
+                    np.array(frame_data["K"]),
+                    frame,
+                    np.array(frame_data["R"]),
+                    np.array(frame_data["t"]),
+                    frame_data["bboxes"],
+                )
+
+                frame_idx += 1
+
         recv_t = Thread(target=recv_loop, daemon=True)
         work_t = Thread(target=worker_loop, daemon=True)
         recv_t.start()
@@ -358,6 +395,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         with open(cvdata_json_path, "a") as f:
             f.write("\n]")
         conn.close()
+        postprocess_loop(cvdata_json_path, raw_mp4_path)
 
 
 def start_server(output_path: str, host=HOST, port=PORT):
