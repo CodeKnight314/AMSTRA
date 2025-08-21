@@ -10,19 +10,60 @@ class TriangulationF2FModule:
         self.k = k
         self.orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self._buffer = deque(maxlen=100)
 
     def __call__(self, frame1, R1, t1, frame2, R2, t2, bboxes):
         return self.infer(frame1, R1, t1, frame2, R2, t2, bboxes)
 
-    def _feature_match(
-        self, frame1: np.ndarray, frame2: np.ndarray, bboxes: List[Tuple[int]]
+    def _make_mask(self, shape_hw, bboxes):
+        h, w = shape_hw
+        mask = np.zeros((h, w), dtype=np.uint8)
+        for i, (x1, y1, x2, y2) in enumerate(bboxes):
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w - 1))
+            y2 = max(0, min(y2, h - 1))
+
+            if x2 > x1 and y2 > y1:
+                mask[y1 : y2 + 1, x1 : x2 + 1] = 255
+
+        return mask
+
+    def insert(
+        self,
+        K: np.ndarray,
+        frame: np.ndarray,
+        R: np.ndarray,
+        t: np.ndarray,
+        bboxes: List[Tuple[int]],
     ):
-        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+        self.k = K
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_mask = self._make_mask(frame, bboxes)
+        keypoints, descriptors = self.orb.detectAndCompute(frame, frame_mask)
 
-        kp1, des1 = self.orb.detectAndCompute(gray1, None)
-        kp2, des2 = self.orb.detectAndCompute(gray2, None)
+        if len(keypoints) < 8 or descriptors is None:
+            transition = {
+                "K": K,
+                "R": R,
+                "t": t,
+                "keypoints": [],
+                "descriptors": None,
+            }
 
+        else:
+            transition = {
+                "K": K,
+                "R": R,
+                "t": t,
+                "keypoints": keypoints,
+                "descriptors": descriptors,
+            }
+
+        self._buffer.append(transition)
+
+    def _feature_match(self, kp1, des1, kp2, des2):
         matches = self.bf.match(des1, des2)
         matches = sorted(matches, key=lambda x: x.distance)
 
@@ -37,23 +78,29 @@ class TriangulationF2FModule:
             pts1 = pts1[mask.ravel() == 1]
             pts2 = pts2[mask.ravel() == 1]
 
-        valid_pts1 = []
-        valid_pts2 = []
-        for pt1, pt2 in zip(pts1, pts2):
-            if self._is_in_bbox(pt1, bboxes) and self._is_in_bbox(pt2, bboxes):
-                valid_pts1.append(pt1)
-                valid_pts2.append(pt2)
-
-        pts1 = np.array(valid_pts1, dtype=np.float32)
-        pts2 = np.array(valid_pts2, dtype=np.float32)
-
         return pts1, pts2
 
-    def infer(self, frame1, R1, t1, frame2, R2, t2, bboxes):
+    def infer(self, bboxes: List[Tuple[int]]):
+        if len(self._buffer) < 2:
+            raise ValueError(
+                f"Length of internal buffer is not long enough for inference"
+            )
+
+        candidate1 = self._buffer[0]
+        candidate2 = self._buffer[-1]
+
+        R1, t1 = candidate1["R"], candidate1["t"]
+        R2, t2 = candidate2["R"], candidate2["t"]
+
         P1 = self.k @ np.hstack((R1, t1))
         P2 = self.k @ np.hstack((R2, t2))
 
-        pts1, pts2 = self._feature_match(frame1, frame2, bboxes)
+        pts1, pts2 = self._feature_match(
+            candidate1["keypoints"],
+            candidate1["descriptors"],
+            candidate2["keypoints"],
+            candidate2["descriptors"],
+        )
         if len(pts1) == 0 or len(pts2) == 0:
             return {i: [] for i in range(len(bboxes))}
 
@@ -67,9 +114,6 @@ class TriangulationF2FModule:
                     bbox_to_pts[i].append(X)
 
         return bbox_to_pts
-
-    def update(self, k: np.ndarray):
-        self.k = k
 
     def _is_in_bbox(self, pts: Tuple[float, float], bboxes: List[Tuple[int]]):
         x, y = pts
@@ -120,10 +164,13 @@ class TriangulationBAModule:
         frame: np.ndarray,
         R: np.ndarray,
         t: np.ndarray,
-        bboxes: List[Tuple[int]],
+        bboxes: List[Tuple[int]] = None,
     ):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_mask = self._make_mask(frame.shape, bboxes)
+        if bboxes is None:
+            frame_mask = None
+        else:
+            frame_mask = self._make_mask(frame.shape, bboxes)
         keypoints, descriptors = self.orb.detectAndCompute(frame, frame_mask)
 
         if len(keypoints) < 8 or descriptors is None:
