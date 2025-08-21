@@ -11,7 +11,7 @@ import cv2
 from yolo_detector import YoloDetectionMain
 from midas_depth_estimation import MiDasEstimation
 from sort_tracking import SORTTrackManager
-from triangulation import TriangulationBAModule
+from triangulation import TriangulationBAModule, TriangulationF2FModule
 import argparse
 import os
 import logging
@@ -102,20 +102,14 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
 
         yolo = YoloDetectionMain(conf_threshold=CONF)
         logging.info("YoloV8 model instantiated")
-        midas = MiDasEstimation()
-        logging.info("MiDaS model instantiated")
         sort_manager = SORTTrackManager()
         logging.info("SORT manager instantiated")
-        tri_module = TriangulationBAModule(maxlen=100)
-        logging.info("Triangulation module instantiated")
 
         json_path = os.path.join(output_path, f"stream_{time_str}.json")
         cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(
-            os.path.join(output_path, f"stream_{time_str}.mp4"), fourcc, FPS, (640, 480)
-        )
-        logging.info("Video Writer instantiated")
+        cvdata_json_path = os.path.join(output_path, f"stream_{time_str}_cv.json")
+        label_mp4_path = os.path.join(output_path, f"stream_{time_str}_labeled.mp4")
+        raw_mp4_path = os.path.join(output_path, f"stream_{time_str}_raw.mp4")
 
         process = psutil.Process(os.getpid())
         process.cpu_percent(interval=None)
@@ -132,9 +126,10 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     "yolo_cores",
                 ]
             )
+        with open(cvdata_json_path, "w") as f:
+            f.write("[\n")
 
         start_timestamp = time.time()
-        first_entry = True
 
         q = queue.Queue(maxsize=1e6)
         stop_sentinel = object()
@@ -166,10 +161,22 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     pass
 
         def worker_loop():
-            nonlocal first_entry
             frame_buffer = deque(maxlen=100)
             outputs = []
-            initialize = False
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            label_mp4 = cv2.VideoWriter(
+                label_mp4_path,
+                fourcc,
+                FPS,
+                (640, 480),
+            )
+            raw_mp4 = cv2.VideoWriter(
+                raw_mp4_path,
+                fourcc,
+                FPS,
+                (640, 480),
+            )
+            logging.info("Video Writer instantiated")
 
             processing_times = {
                 "motion_gate": {"total": 0, "count": 0},
@@ -189,14 +196,11 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 logging.info(f"Total Frames remaining to process: {q.qsize()}")
                 idx, frame, metadata, ts = q.get()
 
-                points3d = {i: [] for i in range(len(outputs))}
-                if len(tri_module) > TRI_MIN_SIZE and not initialize:
-                    tri_module.initialize_3D_points()
-                    initialize = True
-
                 if frame is stop_sentinel:
                     logging.info("End of queue reached. Exiting worker thread.")
                     break
+                else:
+                    raw_mp4.write(frame)
 
                 force_detection = idx % 10 == 0
 
@@ -212,17 +216,6 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     start_time = time.time()
                     outputs = sort_manager.step([], idx)
                     update_time("sort_tracking", start_time)
-
-                    start_time = time.time()
-                    bboxes = [output["bbox"] for output in outputs]
-                    tri_module.insert(
-                        metadata["K"],
-                        frame,
-                        metadata["R"],
-                        metadata["T"],
-                        bboxes,
-                    )
-                    update_time("triangulation", start_time)
                 else:
                     start_time = time.time()
                     y_results, y_dt, y_pct_all, y_pct_machine, y_cores = (
@@ -258,57 +251,49 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     outputs = sort_manager.step(detection_results, idx)
                     update_time("sort_tracking", start_time)
 
-                    if initialize:
-                        start_time = time.time()
-                        bboxes = [output["bbox"] for output in outputs]
-                        tri_module.insert(
-                            metadata["K"],
-                            frame,
-                            metadata["R"],
-                            metadata["T"],
-                            bboxes,
-                        )
-                        points3d = tri_module.infer(
-                            metadata["K"],
-                            frame,
-                            metadata["R"],
-                            metadata["T"],
-                            bboxes,
-                            do_ba=force_detection,
-                        )
-                        update_time("triangulation", start_time)
-
                 frame_buffer.append(
                     (frame, metadata["K"], metadata["R"], metadata["T"])
                 )
 
+                with open(cvdata_json_path, "a") as f:
+                    f.write(",\n")
+                    json.dump(
+                        {
+                            "frame_idx": idx,
+                            "data": {
+                                "K": metadata["K"].tolist(),
+                                "R": metadata["R"].tolist(),
+                                "t": metadata["T"].tolist(),
+                                "bboxes": [data["bbox"] for data in outputs],
+                            },
+                        },
+                        f,
+                        indent=4,
+                    )
+
                 start_time = time.time()
                 for i, output in enumerate(outputs):
                     with open(json_path, "a") as f:
-                        if not first_entry:
-                            f.write(",\n")
+                        f.write(",\n")
                         json.dump(output, f, indent=4)
-                        first_entry = False
 
                     x1, y1, x2, y2 = map(int, output["bbox"])
                     track_id = output["track_id"]
                     class_name = output["class_name"]
                     if class_name not in CLASS_FILTER:
                         continue
+
                     color = (0, 255, 0)
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
                     label = f"{class_name} ID:{track_id} Predict: {output['kalman']}"
                     coords_label = ""
-                    pts = points3d.get(i, [])
-                    if len(pts) > 0:
-                        coords_3d = np.mean(pts, axis=0)
-                        coords_label = f"3D: {coords_3d[0]:.2f}, {coords_3d[1]:.2f}, {coords_3d[2]:.2f}"
 
                     (label_w, label_h), baseline = cv2.getTextSize(
                         label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
                     )
+
                     (coords_w, coords_h), baseline2 = cv2.getTextSize(
                         coords_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
                     )
@@ -346,9 +331,10 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                         )
                 update_time("drawing_on_frame", start_time)
 
-                out.write(frame)
+                label_mp4.write(frame)
 
-            out.release()
+            label_mp4.release()
+            raw_mp4.release()
             logging.info("Video writer released in worker_loop")
             print("Average processing times:")
             for name, data in processing_times.items():
@@ -365,11 +351,13 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         logging.error(f"Stream crashed: {e}")
 
     finally:
+        logging.info(f"[-] Disconnected: {addr}")
         work_t.join()
         with open(json_path, "a") as f:
             f.write("\n]")
+        with open(cvdata_json_path, "a") as f:
+            f.write("\n]")
         conn.close()
-        logging.info(f"[-] Disconnected: {addr}")
 
 
 def start_server(output_path: str, host=HOST, port=PORT):
