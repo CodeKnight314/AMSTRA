@@ -3,6 +3,17 @@ import cv2
 from typing import Tuple, List
 from collections import deque
 from scipy.optimize import least_squares
+import json
+import logging
+import argparse
+from tqdm import tqdm
+import os 
+import datetime
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 
 class TriangulationF2FModule:
@@ -164,13 +175,10 @@ class TriangulationBAModule:
         frame: np.ndarray,
         R: np.ndarray,
         t: np.ndarray,
-        bboxes: List[Tuple[int]] = None,
+        bboxes: List[Tuple[int]],
     ):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if bboxes is None:
-            frame_mask = None
-        else:
-            frame_mask = self._make_mask(frame.shape, bboxes)
+        frame_mask = self._make_mask(frame.shape, bboxes)
         keypoints, descriptors = self.orb.detectAndCompute(frame, frame_mask)
 
         if len(keypoints) < 8 or descriptors is None:
@@ -201,10 +209,45 @@ class TriangulationBAModule:
         if len(self._buffer) >= 2:
             self.update_tracks(len(self._buffer) - 2, len(self._buffer) - 1)
 
+    def _skew_symmetric(self, v):
+        v = v.reshape(
+            3,
+        )
+        return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+
+    def _findEssentialMat(
+        self, R1: np.ndarray, t1: np.ndarray, R2: np.ndarray, t2: np.ndarray
+    ):
+        R_relative = R2 @ R1.T
+        t_relative = t2 - R_relative @ t1
+        E = self._skew_symmetric(t_relative) @ R_relative
+        return E
+
+    def _sampson_inliers(
+        self,
+        pts1: np.ndarray,
+        pts2: np.ndarray,
+        K: np.ndarray,
+        E: np.ndarray,
+        thresh: float = 1.0,
+    ):
+        Kinv = np.linalg.inv(K)
+        x1 = (Kinv @ np.c_[pts1, np.ones(len(pts1))].T).T
+        x2 = (Kinv @ np.c_[pts2, np.ones(len(pts2))].T).T
+        Ex1 = (E @ x1.T).T
+        ETx2 = (E.T @ x2.T).T
+        x2Ex1 = np.sum(x2 * (E @ x1.T).T, axis=1)
+        denom = (
+            Ex1[:, 0] ** 2 + Ex1[:, 1] ** 2 + ETx2[:, 0] ** 2 + ETx2[:, 1] ** 2 + 1e-12
+        )
+        d = (x2Ex1**2) / denom
+        return d < (thresh**2)
+
     def match_frames(self, idx1: int, idx2: int):
         f1, f2 = self._buffer[idx1], self._buffer[idx2]
         if f1["descriptors"] is None or f2["descriptors"] is None:
             return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32), []
+
         matches = self.bf.match(f1["descriptors"], f2["descriptors"])
         if matches is None:
             return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32), []
@@ -213,9 +256,8 @@ class TriangulationBAModule:
         pts1 = np.float32([f1["keypoints"][m.queryIdx].pt for m in matches])
         pts2 = np.float32([f2["keypoints"][m.trainIdx].pt for m in matches])
 
-        E, mask = cv2.findEssentialMat(
-            pts1, pts2, f1["K"], method=cv2.RANSAC, prob=0.999, threshold=1.0
-        )
+        E = self._findEssentialMat(f1["R"], f1["t"], f2["R"], f2["t"])
+        mask = self._sampson_inliers(pts1, pts2, f1["K"], E)
 
         if mask is not None:
             pts1 = pts1[mask.ravel() == 1]
@@ -250,9 +292,6 @@ class TriangulationBAModule:
                 self.tracks[matched_track_idx][idx2] = (u2, v2)
             else:
                 new_track = {idx1: (u1, v1), idx2: (u2, v2)}
-                self.tracks.append(new_track)
-
-                self.points3D.append(None)
 
                 f1, f2 = self._buffer[idx1], self._buffer[idx2]
                 pts1 = np.array([[u1, v1]], dtype=np.float32)
@@ -324,19 +363,10 @@ class TriangulationBAModule:
         if not self.points3D:
             raise ValueError("No 3D points to refine. Run initialize_points() first.")
 
-        # Mix of nones and arrays in self.points3d -> optimize the not none points and preserve order
-        targets = []
-        idxes = []
-        for i, elm in enumerate(self.points3D):
-            if elm is not None:
-                idxes.append(i)
-                targets.append(elm)
-
-        X0 = np.array(targets).reshape(-1, 3)
+        X0 = np.array(self.points3D).reshape(-1, 3)
         result = least_squares(self._reprojection_residuals, X0.ravel(), verbose=2)
-        refined = result.x.reshape(-1, 3).tolist()
-        for i in range(len(refined)):
-            self.points3D[idxes[i]] = refined[i]
+        self.points3D = result.x.reshape(-1, 3).tolist()
+
         return self.points3D
 
     def project(self, K: np.ndarray, R: np.ndarray, t: np.ndarray, pts_3d):
@@ -400,3 +430,122 @@ class TriangulationBAModule:
 
     def __len__(self):
         return len(self._buffer)
+
+
+def postprocess(cv_path, mp4_path, output_path, maxlen):
+    time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logging.info("Starting Postprocessing...")
+    tri_ba_module = TriangulationBAModule(maxlen=maxlen)
+    logging.info("Triangulation Bundle Adjustment Module initialized.")
+
+    points3d_json_path = os.path.join(output_path, f"stream_{time_str}_points3d.json")
+    firstOutputEntry = True
+    with open(points3d_json_path, "w") as f:
+        f.write("[\n")
+
+    with open(cv_path, "r") as f:
+        cv_data = json.load(f)
+
+    cap = cv2.VideoCapture(mp4_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened():
+        logging.error("Could not open video file.")
+        return
+
+    frame_idx = 0
+    initialized = False
+    logging.info(f"Total frames: {total_frames}")
+    for frame_idx in tqdm(range(total_frames), desc="Processing frames", leave=False):
+        ret, frame = cap.read()
+        if not ret:
+            logging.error("Could not read frame.")
+            break
+
+        frame_data = cv_data[frame_idx]["data"]
+        if not frame_data:
+            logging.warning(f"No CV data found for frame {frame_idx}")
+            continue
+
+        tri_ba_module.insert(
+            np.array(frame_data["K"]),
+            frame,
+            np.array(frame_data["R"]),
+            np.array(frame_data["t"]),
+            frame_data["bboxes"],
+        )
+
+        if initialized and frame_idx % 50 == 0:
+            logging.info(f"Inference Triggered at Frame Idx: {frame_idx}")
+            points3d = tri_ba_module.infer(
+                np.array(frame_data["K"]),
+                frame,
+                np.array(frame_data["R"]),
+                np.array(frame_data["t"]),
+                frame_data["bboxes"],
+                do_ba=True,
+            )
+
+            with open(points3d_json_path, "a") as f:
+                if not firstOutputEntry:
+                    f.write(",\n")
+                json.dump(points3d, f, indent=4)
+                firstOutputEntry = False
+
+        if len(tri_ba_module) == maxlen and not initialized:
+            logging.info("Initializing_3D_points")
+            tri_ba_module.initialize_3D_points()
+            initialized = True
+            points3d = tri_ba_module.infer(
+                np.array(frame_data["K"]),
+                frame,
+                np.array(frame_data["R"]),
+                np.array(frame_data["t"]),
+                frame_data["bboxes"],
+                do_ba=True,
+            )
+
+            with open(points3d_json_path, "a") as f:
+                if not firstOutputEntry:
+                    f.write(",\n")
+                json.dump(points3d, f, indent=4)
+                firstOutputEntry = False
+
+    with open(points3d_json_path, "a") as f:
+        f.write("\n]")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run triangulation post-processing on video and CV data"
+    )
+    parser.add_argument(
+        "--cv-path",
+        type=str,
+        required=True,
+        help="Path to the CV data JSON file containing camera parameters and detections",
+    )
+    parser.add_argument(
+        "--mp4-path",
+        type=str,
+        required=True,
+        help="Path to the MP4 video file to process",
+    )
+    parser.add_argument(
+        "--maxlen",
+        type=int,
+        default=120,
+        help="Maximum buffer length for triangulation (default: 100)",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        required=True,
+        help="Path to the output directory",
+    )
+    args = parser.parse_args()
+
+    try:
+        postprocess(args.cv_path, args.mp4_path, args.output_path, args.maxlen)
+    except Exception as e:
+        logging.error(f"Error during post-processing: {str(e)}")
+        raise
