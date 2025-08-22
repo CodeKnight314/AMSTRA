@@ -7,8 +7,8 @@ import json
 import logging
 import argparse
 from tqdm import tqdm
-import os 
-import datetime
+import os
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -294,6 +294,7 @@ class TriangulationBAModule:
                 new_track = {idx1: (u1, v1), idx2: (u2, v2)}
 
                 f1, f2 = self._buffer[idx1], self._buffer[idx2]
+
                 pts1 = np.array([[u1, v1]], dtype=np.float32)
                 pts2 = np.array([[u2, v2]], dtype=np.float32)
                 X = self._triangulate_two_views(pts1, pts2, f1, f2)
@@ -422,7 +423,7 @@ class TriangulationBAModule:
         )
 
         angles = np.degrees(np.arccos(np.clip(cosang, -1, 1)))
-        valid_parallax = angles > 1.0
+        valid_parallax = angles > 5.0
         return valid_parallax
 
     def _filter(self, f1, f2, X):
@@ -432,8 +433,9 @@ class TriangulationBAModule:
         return len(self._buffer)
 
 
-def postprocess(cv_path, mp4_path, output_path, maxlen):
+def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs(output_path, exist_ok=True)
     logging.info("Starting Postprocessing...")
     tri_ba_module = TriangulationBAModule(maxlen=maxlen)
     logging.info("Triangulation Bundle Adjustment Module initialized.")
@@ -454,11 +456,9 @@ def postprocess(cv_path, mp4_path, output_path, maxlen):
 
     frame_idx = 0
     initialized = False
-    logging.info(f"Total frames: {total_frames}")
     for frame_idx in tqdm(range(total_frames), desc="Processing frames", leave=False):
         ret, frame = cap.read()
         if not ret:
-            logging.error("Could not read frame.")
             break
 
         frame_data = cv_data[frame_idx]["data"]
@@ -488,7 +488,7 @@ def postprocess(cv_path, mp4_path, output_path, maxlen):
             with open(points3d_json_path, "a") as f:
                 if not firstOutputEntry:
                     f.write(",\n")
-                json.dump(points3d, f, indent=4)
+                json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
                 firstOutputEntry = False
 
         if len(tri_ba_module) == maxlen and not initialized:
@@ -507,7 +507,7 @@ def postprocess(cv_path, mp4_path, output_path, maxlen):
             with open(points3d_json_path, "a") as f:
                 if not firstOutputEntry:
                     f.write(",\n")
-                json.dump(points3d, f, indent=4)
+                json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
                 firstOutputEntry = False
 
     with open(points3d_json_path, "a") as f:
@@ -545,7 +545,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        postprocess(args.cv_path, args.mp4_path, args.output_path, args.maxlen)
+        triangulation_postprocess(
+            args.cv_path, args.mp4_path, args.output_path, args.maxlen
+        )
     except Exception as e:
         logging.error(f"Error during post-processing: {str(e)}")
         raise
