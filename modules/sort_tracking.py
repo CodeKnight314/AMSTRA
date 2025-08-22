@@ -5,12 +5,15 @@ import math
 
 
 class KalmanFilter:
-    def __init__(self, initial_state: np.ndarray):
+
+    def __init__(self, initial_state: np.ndarray, dt: float = 1.0):
+        self.dt = dt
+
         self.F = np.array(
             [
-                [1, 0, 0, 0, 1, 0, 0],
-                [0, 1, 0, 0, 0, 1, 0],
-                [0, 0, 1, 0, 0, 0, 1],
+                [1, 0, 0, 0, dt, 0, 0],
+                [0, 1, 0, 0, 0, dt, 0],
+                [0, 0, 1, 0, 0, 0, dt],
                 [0, 0, 0, 1, 0, 0, 0],
                 [0, 0, 0, 0, 1, 0, 0],
                 [0, 0, 0, 0, 0, 1, 0],
@@ -29,25 +32,40 @@ class KalmanFilter:
 
         self.x = initial_state
 
-        self.P = np.eye(7) * 500.0
+        self.P = np.diag([50.0, 50.0, 1e4, 10.0, 500.0, 500.0, 1e3]).astype(float)
 
-        self.Q = np.eye(7)
+        self.Q = np.diag([1.0, 1.0, 10.0, 0.01, 1.0, 1.0, 10.0]).astype(float)
 
-        self.R = np.eye(4) * 10.0
+        self.R = np.diag([10.0, 10.0, 100.0, 0.1]).astype(float)
 
         self.I = np.eye(7)
+
+        self.s_min = 1e-3
+        self.r_min, self.r_max = 0.2, 5.0
+
+    def _sanitize(self):
+        if self.x[2, 0] < self.s_min:
+            self.x[2, 0] = self.s_min
+            self.x[6, 0] = 0.0
+        self.x[3, 0] = float(np.clip(self.x[3, 0], self.r_min, self.r_max))
 
     def predict(self):
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
+        self._sanitize()
         return self.x
 
     def update(self, measurement: np.ndarray):
+        s_meas = float(measurement[2])
+        self.R[2, 2] = max(1e2, (0.05 * max(1.0, s_meas)) ** 2)
+
         y = measurement - (self.H @ self.x)
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
+
         self.x = self.x + (K @ y)
         self.P = (self.I - (K @ self.H)) @ self.P
+        self._sanitize()
         return self.x
 
     def get_state(self) -> np.ndarray:
@@ -126,9 +144,7 @@ class Track:
         self.age = 1
 
     def predict(self, frame_idx: int):
-        self.age += 1
-        self.time_since_update += 1
-        state = self.filter.predict()
+        state = self.filter.get_state()
         bbox_pred = state_to_bbox(state).tolist()
         u, v = float(state[0]), float(state[1])
 
@@ -150,7 +166,6 @@ class Track:
     def update(self, new_payload: dict):
         self.time_since_update = 0
         self.hit_streak += 1
-        self.age += 1
         z = bbox_to_measurement(new_payload["bbox"])
         self.filter.update(z)
 
@@ -168,18 +183,25 @@ class Track:
     def get_state(self):
         return self.filter.get_state()
 
+    def kf_predict_only(self):
+        self.filter.predict()
+
 
 class SORTTrackManager:
-    def __init__(self, max_age: int = 5, min_age: int = 1, iou_threshold: float = 0.3):
+    def __init__(
+        self,
+        max_age: int = 20,
+        min_age: int = 1,
+        iou_threshold: float = 0.1,
+    ):
         self.max_age = max_age
         self.min_age = min_age
         self.iou_threshold = iou_threshold
-        self.tracks: List[Track] = []
+        self.tracks = []
         self.curr_track_id = 0
 
     def step(self, detections: List[Dict], frame_idx: int) -> List[Dict]:
         output = []
-
         matches = []
         unmatched_tracks = []
         unmatched_dets = []
@@ -192,56 +214,101 @@ class SORTTrackManager:
                 output.append(dict(new_track.payload))
             return output
 
+        for t in self.tracks:
+            t.kf_predict_only()
+            t.age += 1
+            t.time_since_update += 1
+
         if not detections:
             for track in self.tracks:
-                prediction = track.predict(frame_idx)
-                output.append(prediction)
+                if track.time_since_update <= self.max_age:
+                    state = track.get_state()
+                    payload = dict(track.payload)
+                    payload.update(
+                        {
+                            "frame_idx": frame_idx,
+                            "center": (float(state[0]), float(state[1])),
+                            "bbox": state_to_bbox(state).tolist(),
+                            "conf": None,
+                            "rel_depth_value": None,
+                            "ts_detect": None,
+                            "ts_depth": None,
+                            "kalman": True,
+                        }
+                    )
+                    output.append(payload)
             self.tracks = [
                 t for t in self.tracks if t.time_since_update <= self.max_age
             ]
             return output
 
-        if self.tracks and detections is not None and len(detections) > 0:
-            iou_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
-
-            for t_idx, track in enumerate(self.tracks):
-                pred_bbox = track.get_bbox()
-                for d_idx, detection in enumerate(detections):
-                    detected_bbox = detection["bbox"]
-                    iou_matrix[t_idx, d_idx] = iou(pred_bbox, detected_bbox)
-
-            rows, cols = linear_sum_assignment(-iou_matrix)
-            assigned_tracks = set()
-            assigned_detection = set()
-            for r, c in zip(rows, cols):
-                if iou_matrix[r, c] > self.iou_threshold:
-                    matches.append((r, c))
-                    assigned_tracks.add(r)
-                    assigned_detection.add(c)
-
-            for t_idx, track in enumerate(self.tracks):
-                if t_idx not in assigned_tracks:
-                    unmatched_tracks.append(t_idx)
-
+        iou_matrix = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
+        for t_idx, track in enumerate(self.tracks):
+            pred_bbox = track.get_bbox()
             for d_idx, detection in enumerate(detections):
-                if d_idx not in assigned_detection:
-                    unmatched_dets.append(d_idx)
+                iou_matrix[t_idx, d_idx] = iou(pred_bbox, detection["bbox"])
+
+        rows, cols = linear_sum_assignment(-iou_matrix)
+        assigned_tracks, assigned_detection = set(), set()
+        for r, c in zip(rows, cols):
+            if iou_matrix[r, c] > self.iou_threshold:
+                matches.append((r, c))
+                assigned_tracks.add(r)
+                assigned_detection.add(c)
+
+        for t_idx in range(len(self.tracks)):
+            if t_idx not in assigned_tracks:
+                unmatched_tracks.append(t_idx)
+
+        for d_idx in range(len(detections)):
+            if d_idx not in assigned_detection:
+                unmatched_dets.append(d_idx)
 
         for t_idx, d_idx in matches:
             payload = self.tracks[t_idx].update(detections[d_idx])
+            self.tracks[t_idx].time_since_update = 0
+            self.tracks[t_idx].age = 0
             output.append(payload)
 
         for idx in unmatched_tracks:
             track = self.tracks[idx]
-            prediction = track.predict(frame_idx)
-            if track.hit_streak >= self.min_age:
-                output.append(prediction)
+            if track.time_since_update <= self.max_age:
+                state = track.get_state()
+                payload = dict(track.payload)
+                payload.update(
+                    {
+                        "frame_idx": frame_idx,
+                        "center": (float(state[0]), float(state[1])),
+                        "bbox": state_to_bbox(state).tolist(),
+                        "conf": None,
+                        "rel_depth_value": None,
+                        "ts_detect": None,
+                        "ts_depth": None,
+                        "kalman": True,
+                    }
+                )
+                output.append(payload)
 
         for idx in unmatched_dets:
-            new_track = Track(detections[idx], self.curr_track_id)
-            self.curr_track_id += 1
+            det = detections[idx]
+
+            if det.get("conf", 1.0) < 0.75:
+                continue
+
+            bbox_det = np.array(det["bbox"])
+            too_close = False
+            for out in output:
+                if iou(bbox_det, np.array(out["bbox"])) > 0.65:
+                    too_close = True
+                    break
+
+            if too_close:
+                continue
+
+            new_track = Track(det, self.curr_track_id)
             self.tracks.append(new_track)
             output.append(dict(new_track.payload))
+            self.curr_track_id += 1
 
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
         return output
