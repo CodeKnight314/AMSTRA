@@ -283,6 +283,8 @@ while robot.step(timestep) != -1:
             ]
         )
         R = Rz @ Ry @ Rx @ R_cam
+        t = -1 * R.T @ t
+        R = R.T
 
         fov = camera.getFov()
         width = camera.getWidth()

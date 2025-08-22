@@ -9,9 +9,8 @@ from config import *
 import numpy as np
 import cv2
 from yolo_detector import YoloDetectionMain
-from midas_depth_estimation import MiDasEstimation
 from sort_tracking import SORTTrackManager
-from triangulation import TriangulationBAModule, TriangulationF2FModule
+from triangulation import TriangulationBAModule
 import argparse
 import os
 import logging
@@ -21,6 +20,7 @@ import queue
 from threading import Thread
 from typing import List
 from collections import deque
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,6 +161,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     pass
 
         def worker_loop():
+            firstNavEntry = True
+            firstOutputEntry = True
             frame_buffer = deque(maxlen=100)
             outputs = []
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -256,7 +258,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 )
 
                 with open(cvdata_json_path, "a") as f:
-                    f.write(",\n")
+                    if not firstNavEntry:
+                        f.write(",\n")
                     json.dump(
                         {
                             "frame_idx": idx,
@@ -270,12 +273,15 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                         f,
                         indent=4,
                     )
+                    firstNavEntry = False
 
                 start_time = time.time()
                 for i, output in enumerate(outputs):
                     with open(json_path, "a") as f:
-                        f.write(",\n")
+                        if not firstOutputEntry:
+                            f.write(",\n")
                         json.dump(output, f, indent=4)
+                        firstOutputEntry = False
 
                     x1, y1, x2, y2 = map(int, output["bbox"])
                     track_id = output["track_id"]
