@@ -23,7 +23,7 @@ def wrap_to_pi(angle):
 
 
 def load_waypoints():
-    path = "waypoint.txt"
+    path = "waypoints.txt"
     waypoints = []
     with open(path, "r") as f:
         for line in f:
@@ -35,12 +35,13 @@ def load_waypoints():
             except ValueError:
                 print(f"Malformed data could not be read for line: {line}")
                 continue
-            
+
             waypoints.append((x, y))
-        
+
     print("Total waypoints: ", len(waypoints))
 
     return waypoints
+
 
 def dist(x1, y1, x2, y2):
     return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
@@ -317,8 +318,6 @@ while robot.step(timestep) != -1:
             ]
         )
         R = Rz @ Ry @ Rx @ R_cam
-        t = -1 * R.T @ t
-        R = R.T
 
         fov = camera.getFov()
         width = camera.getWidth()
@@ -377,7 +376,7 @@ while robot.step(timestep) != -1:
     roll_input = (
         k_roll_p * clamp(roll - initial_roll, -1.0, 1.0) + gx + roll_disturbance
     )
-    
+
     yaw_input = yaw_disturbance * 0.35
 
     clamped_diff_alt = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
