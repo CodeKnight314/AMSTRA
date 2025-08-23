@@ -10,22 +10,17 @@ import numpy as np
 import cv2
 from yolo_detector import YoloDetectionMain
 from sort_tracking import SORTTrackManager
-from triangulation import TriangulationBAModule
+from dashboard import Dashboard
 import argparse
 import os
-import logging
 from datetime import datetime
 import time
 import queue
 from threading import Thread
 from typing import List
 from collections import deque
-from tqdm import tqdm
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+dashboard = Dashboard(host=HOST, port=PORT)
 
 
 def motion_gate(
@@ -94,16 +89,22 @@ def recv_metadata(sock: socket.socket) -> List[np.ndarray]:
 
 def process_stream_async(output_path: str, conn: socket.socket, addr: str):
     try:
-        logging.info(f"[+] Connected: {addr}")
+        stream_id = f"{addr[0]}:{addr[1]}"
+        dashboard.update_stream(
+            stream_id,
+            frames=0,
+            queue=0,
+            cpu=0,
+            status="Connected",
+            time_created=datetime.now(),
+        )
         now = datetime.now()
         time_str = now.strftime("%H_%M_%S")
         output_path = os.path.join(output_path, time_str)
         os.makedirs(output_path, exist_ok=True)
 
         yolo = YoloDetectionMain(conf_threshold=CONF)
-        logging.info("YoloV8 model instantiated")
         sort_manager = SORTTrackManager()
-        logging.info("SORT manager instantiated")
 
         json_path = os.path.join(output_path, f"stream_{time_str}.json")
         cpu_csv_path = os.path.join(output_path, f"stream_{time_str}.csv")
@@ -153,7 +154,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                                 pass
                     frame_idx += 1
             except Exception as e:
-                logging.info(f"recv_loop ending: {e}")
+                pass
             finally:
                 try:
                     q.put_nowait((None, stop_sentinel, None, None))
@@ -163,7 +164,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         def worker_loop():
             firstNavEntry = True
             firstOutputEntry = True
-            frame_buffer = deque(maxlen=100)
+            frame_buffer = deque(maxlen=1000)
             outputs = []
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             label_mp4 = cv2.VideoWriter(
@@ -178,52 +179,29 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 FPS,
                 (640, 480),
             )
-            logging.info("Video Writer instantiated")
-
-            processing_times = {
-                "motion_gate": {"total": 0, "count": 0},
-                "yolo_detection": {"total": 0, "count": 0},
-                "midas_estimation": {"total": 0, "count": 0},
-                "sort_tracking": {"total": 0, "count": 0},
-                "drawing_on_frame": {"total": 0, "count": 0},
-                "triangulation": {"total": 0, "count": 0},
-            }
-
-            def update_time(name, start):
-                duration = time.time() - start
-                processing_times[name]["total"] += duration
-                processing_times[name]["count"] += 1
 
             while True:
-                logging.info(f"Total Frames remaining to process: {q.qsize()}")
                 idx, frame, metadata, ts = q.get()
 
                 if frame is stop_sentinel:
-                    logging.info("End of queue reached. Exiting worker thread.")
                     break
                 else:
                     raw_mp4.write(frame)
 
                 force_detection = idx % 10 == 0
 
-                start_time = time.time()
                 motion = (
                     True
                     if not frame_buffer
                     else (force_detection or motion_gate(frame, frame_buffer[-1][0]))
                 )
-                update_time("motion_gate", start_time)
 
                 if not motion:
-                    start_time = time.time()
                     outputs = sort_manager.step([], idx)
-                    update_time("sort_tracking", start_time)
                 else:
-                    start_time = time.time()
                     y_results, y_dt, y_pct_all, y_pct_machine, y_cores = (
                         measure_cpu_usage(process, yolo, frame)
                     )
-                    update_time("yolo_detection", start_time)
 
                     timestamp_cpu = ts - start_timestamp
                     with open(cpu_csv_path, "a", newline="") as f:
@@ -249,9 +227,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                         }
                         detection_results.append(payload)
 
-                    start_time = time.time()
                     outputs = sort_manager.step(detection_results, idx)
-                    update_time("sort_tracking", start_time)
 
                 frame_buffer.append(
                     (frame, metadata["K"], metadata["R"], metadata["T"])
@@ -275,7 +251,14 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     )
                     firstNavEntry = False
 
-                start_time = time.time()
+                dashboard.update_stream(
+                    stream_id,
+                    frames=idx,
+                    queue=q.qsize(),
+                    cpu=round(process.cpu_percent(interval=None) / N_LOGICAL, 2),
+                    status="Running",
+                )
+
                 for i, output in enumerate(outputs):
                     with open(json_path, "a") as f:
                         if not firstOutputEntry:
@@ -335,18 +318,11 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                             1,
                             cv2.LINE_AA,
                         )
-                update_time("drawing_on_frame", start_time)
 
                 label_mp4.write(frame)
 
             label_mp4.release()
             raw_mp4.release()
-            logging.info("Video writer released in worker_loop")
-            print("Average processing times:")
-            for name, data in processing_times.items():
-                if data["count"] > 0:
-                    avg_time = data["total"] / data["count"]
-                    print(f"{name}: {avg_time:.4f}s")
 
         recv_t = Thread(target=recv_loop, daemon=True)
         work_t = Thread(target=worker_loop, daemon=True)
@@ -354,15 +330,16 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         work_t.start()
 
     except Exception as e:
-        logging.error(f"Stream crashed: {e}")
+        dashboard.update_stream(stream_id, status="Crashed", cpu=0, queue=0)
 
     finally:
-        logging.info(f"[-] Disconnected: {addr}")
         work_t.join()
         with open(json_path, "a") as f:
             f.write("\n]")
         with open(cvdata_json_path, "a") as f:
             f.write("\n]")
+        dashboard.update_stream(stream_id, status="Disconnected", cpu=0, queue=0)
+        clear_terminal()
         conn.close()
 
 
@@ -371,7 +348,6 @@ def start_server(output_path: str, host=HOST, port=PORT):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         s.listen(BACKLOG)
-        logging.info(f"🚦 Listening on {host}:{port}")
         while True:
             conn, addr = s.accept()
             t = threading.Thread(
@@ -381,6 +357,8 @@ def start_server(output_path: str, host=HOST, port=PORT):
 
 
 def main(args):
+    dash_thread = threading.Thread(target=dashboard.run, daemon=True)
+    dash_thread.start()
     start_server(output_path=args.o)
 
 

@@ -8,6 +8,14 @@ import psutil
 from skimage.metrics import structural_similarity as ssim
 
 from config import N_LOGICAL
+import os
+
+
+def clear_terminal():
+    if os.name == "nt":
+        _ = os.system("cls")
+    else:
+        _ = os.system("clear")
 
 
 def measure_cpu_usage(
@@ -38,9 +46,7 @@ def measure_cpu_usage(
     return out, dt, pct_all, pct_machine, core_equiv
 
 
-def img_preprocess(
-    image: np.ndarray, dim: Tuple[int, int] = (64, 36)
-) -> np.ndarray:
+def img_preprocess(image: np.ndarray, dim: Tuple[int, int] = (64, 36)) -> np.ndarray:
     """
     Preprocesses an image by resizing and converting it to grayscale.
 
@@ -132,9 +138,7 @@ def get_camera_intrinsic(height: float, width: float, fov: float) -> np.ndarray:
     return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
 
-def get_camera_extrinsic(
-    rotation: np.ndarray, translation: np.ndarray
-) -> np.ndarray:
+def get_camera_extrinsic(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     """
     Calculates the camera extrinsic matrix.
 

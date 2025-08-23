@@ -6,7 +6,15 @@ import struct, socket, time, threading
 from queue import Queue, Full, Empty
 import random
 import math
+import os
 import json
+from enum import Enum
+
+
+class status(Enum):
+    UNVISITED = "Unvisited"
+    APPROACHING = "Approaching"
+    VISITED = "Visited"
 
 
 def get_camera_intrinsic(height: float, width: float, fov: float):
@@ -22,8 +30,15 @@ def wrap_to_pi(angle):
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
+def pos_to_waypoints(current_x, current_y, waypts):
+    pts_dist = []
+    for i, (pts_x, pts_y) in waypts:
+        pts_dist.append(dist(current_x, current_y, pts_x, pts_y))
+    return pts_dist
+
+
 def load_waypoints():
-    path = "waypoint.txt"
+    path = "waypoints.txt"
     waypoints = []
     with open(path, "r") as f:
         for line in f:
@@ -31,16 +46,14 @@ def load_waypoints():
             try:
                 x = int(data[0])
                 y = int(data[1])
-                print(f"Waypoint: {x}, {y}")
             except ValueError:
                 print(f"Malformed data could not be read for line: {line}")
                 continue
-            
+
             waypoints.append((x, y))
-        
-    print("Total waypoints: ", len(waypoints))
 
     return waypoints
+
 
 def dist(x1, y1, x2, y2):
     return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
@@ -209,18 +222,42 @@ front_right_motor = robot.getDevice("front right propeller")
 rear_left_motor = robot.getDevice("rear left propeller")
 rear_right_motor = robot.getDevice("rear right propeller")
 
-print("[client] Establishing connection to simulated ground station")
 sender = FrameClient(host="127.0.0.1", port=5001, timeout=5.0, jpeg_quality=80)
 
 for m in (front_left_motor, front_right_motor, rear_left_motor, rear_right_motor):
     m.setPosition(float("inf"))
     m.setVelocity(1.0)
 
-print("Start the drone...")
+def clear_terminal():
+    if os.name == "nt":
+        _ = os.system("cls")
+    else:
+        _ = os.system("clear")
+
+def print_waypoints_status(waypoints, waypoints_travel, current_x, current_y, frame_count):
+    if frame_count % 60 != 0:
+        return
+    clear_terminal()
+    print("\nDrone Controller Status")
+    print("=" * 50)
+    print(f"{'Waypoint':<15} {'Status':<15} {'Distance':<10}")
+    print("-" * 50)
+    
+    approaching_waypoint = None
+    for i, ((wx, wy), status) in enumerate(zip(waypoints, waypoints_travel)):
+        distance = dist(current_x, current_y, wx, wy)
+        print(f"({wx:<6}, {wy:<6}) {status.value:<15} {distance:<10.2f}")
+        
+        if status == status.APPROACHING:
+            approaching_waypoint = (wx, wy)
+    
+    print("\nInfo:", end=" ")
+    if approaching_waypoint:
+        print(f"Drone is approaching Waypoint: {approaching_waypoint}")
+    print("=" * 50)
 
 cam_width = camera.getWidth()
 cam_height = camera.getHeight()
-print(f"Camera device: {camera.getName()} | {cam_width}x{cam_height}")
 
 
 def camera_frame_bgr():
@@ -239,12 +276,6 @@ while robot.step(timestep) != -1:
     if robot.getTime() > 1.0:
         break
 
-print("Controls:")
-print("- WASD: move (W/S=fwd/back, A/D=strafe)")
-print("- Q/E: yaw left/right")
-print("- R/F: altitude up/down")
-print("- Arrow keys: control camera (Left/Right=yaw, Up/Down=pitch)")
-
 k_vertical_thrust = 68.5
 k_vertical_offset = 0.6
 k_vertical_p = 3.0
@@ -253,6 +284,11 @@ k_pitch_p = 30.0
 
 waypoints = load_waypoints()
 curr_waypoint_idx = 0
+curr_start_time = time.time()
+waypoints_travel = [status.UNVISITED for i in range(len(waypoints))]
+waypoints_travel[curr_waypoint_idx] = status.APPROACHING
+
+
 target_altitude = 20.0
 
 cam_pitch_offset = 0.0
@@ -317,8 +353,6 @@ while robot.step(timestep) != -1:
             ]
         )
         R = Rz @ Ry @ Rx @ R_cam
-        t = -1 * R.T @ t
-        R = R.T
 
         fov = camera.getFov()
         width = camera.getWidth()
@@ -341,14 +375,13 @@ while robot.step(timestep) != -1:
     pitch_disturbance = -2.0
 
     if dist(_x, _y, wx, wy) < 8.5:
-        print(f"Reached waypoint {wx}, {wy}")
+        waypoints_travel[curr_waypoint_idx] = status.VISITED
         curr_waypoint_idx = (curr_waypoint_idx + 1) % len(waypoints)
+        waypoints_travel[curr_waypoint_idx] = status.APPROACHING
         wx, wy = waypoints[curr_waypoint_idx]
-        print(f"Next waypoint: {wx}, {wy}")
 
-    print("Current position: ", round(_x, 2), round(_y, 2))
-    print("Waypoint: ", round(wx, 2), round(wy, 2))
-    print("Distance: ", round(dist(_x, _y, wx, wy), 2))
+    frame_count = int(now * 1000 / timestep)
+    print_waypoints_status(waypoints, waypoints_travel, _x, _y, frame_count)
 
     key = keyboard.getKey()
     while key != -1:
@@ -377,7 +410,7 @@ while robot.step(timestep) != -1:
     roll_input = (
         k_roll_p * clamp(roll - initial_roll, -1.0, 1.0) + gx + roll_disturbance
     )
-    
+
     yaw_input = yaw_disturbance * 0.35
 
     clamped_diff_alt = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
