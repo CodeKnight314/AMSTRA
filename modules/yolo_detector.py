@@ -16,7 +16,7 @@ class YoloDetection:
         self.device = device
         self.conf_threshold = conf_threshold
 
-    def infer(self, image: np.ndarray, return_boxes: bool = True):
+    def infer(self, image: np.ndarray, return_boxes: bool):
         if not isinstance(image, np.ndarray):
             raise TypeError("Input must be a numpy array")
         if image.ndim != 3 or image.shape[2] < 3:
@@ -41,9 +41,13 @@ class YoloDetection:
             x_center = int((x1 + x2) / 2)
             y_center = int((y1 + y2) / 2)
             class_name = self.model.names[cls_id]
-            detections.append(
-                (class_name, conf, (x_center, y_center), np.array([x1, y1, x2, y2]))
-            )
+            if return_boxes:
+                detections.append(
+                    (class_name, conf, (x_center, y_center), np.array([x1, y1, x2, y2]))
+                )
+            else:
+                detections.append((class_name, conf, (x_center, y_center)))
+
         return detections
 
     def __call__(self, image: np.ndarray, return_boxes: bool = True):
@@ -69,7 +73,7 @@ class YoloDetectionCoreML:
         self.device = device
         self.conf_threshold = conf_threshold
 
-    def infer(self, image: Union[np.ndarray, Image.Image], return_boxes: bool = True):
+    def infer(self, image: Union[np.ndarray, Image.Image], return_boxes: bool):
         if isinstance(image, np.ndarray):
             if image.ndim != 3 or image.shape[2] < 3:
                 raise ValueError("Input must be a BGR image (H, W, 3)")
@@ -155,7 +159,11 @@ class YoloDetectionOpenVINO:
                 center_x = (x1 + x2) / 2
                 center_y = (y1 + y2) / 2
                 name = names[cls_id]
-                boxes.append((name, conf, (center_x, center_y), [x1, y1, x2, y2]))
+
+                if return_boxes:
+                    boxes.append((name, conf, (center_x, center_y), [x1, y1, x2, y2]))
+                else:
+                    boxes.append((name, conf, (center_x, center_y)))
         return boxes
 
     def __call__(self, image: np.ndarray, return_boxes: bool = True):
