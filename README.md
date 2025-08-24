@@ -10,7 +10,7 @@
 
 AMSTRA is a designed framework for autonomous and manually controlled drone navigation with real-time object detection and spatial tagging modules. It leverages YoloV8 and SORT-based manager to identify, and track objects of interest. A separate triangulation module uses monocular camera stream to attempt 3D spatial tagging of detected objects. The system is designed for real-time operation, featuring a server-client architecture, a control dashboard, and simulation capabilities.
 
-The project uses Webots as the main simulator due to easy prototyping and access to pre-installed Mavic 2 pro drone model. The simulator can be downloaded ![here](https://cyberbotics.com/#download).
+The project uses Webots as the main simulator due to easy prototyping and access to pre-installed Mavic 2 pro drone model. The simulator can be downloaded [here](https://cyberbotics.com/#download).
 
 ## Project Structure
 
