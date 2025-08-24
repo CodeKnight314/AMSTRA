@@ -1,4 +1,4 @@
-# AMSTRA: Autonomous/Manual control Spatial Tagging & Reconnaissance Framework
+# AMSTRA: Autonomous/Manual Spatial Tagging & Reconnaissance Application
 
 <p align="center">
   <img src="resources/gifs/recording.gif" alt="AMSTRA Demo">
