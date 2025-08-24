@@ -50,14 +50,9 @@ class YoloDetection:
 
         return detections
 
-    def __call__(self, image: np.ndarray, return_boxes: bool = True):
-        return self.infer(image, return_boxes)
-
 
 class YoloDetectionCoreML:
-    def __init__(
-        self, model_name="models/yolov8m.pt", device="cpu", conf_threshold=0.25
-    ):
+    def __init__(self, model_name="models/yolov8m.pt", conf_threshold=0.25):
         mlpackage_path = model_name.replace(".pt", ".mlpackage")
         if not os.path.exists(mlpackage_path):
             yolo_model = YOLO(model_name)
@@ -70,7 +65,6 @@ class YoloDetectionCoreML:
             self.class_names = YOLO(model_name).names
 
         self.model = ct.models.MLModel(mlpackage_path)
-        self.device = device
         self.conf_threshold = conf_threshold
 
     def infer(self, image: Union[np.ndarray, Image.Image], return_boxes: bool):
@@ -117,14 +111,9 @@ class YoloDetectionCoreML:
                 boxes.append((name, conf, (center_x, center_y)))
         return boxes
 
-    def __call__(self, image: np.ndarray, return_boxes: bool = True):
-        return self.infer(image, return_boxes)
-
 
 class YoloDetectionOpenVINO:
-    def __init__(
-        self, model_name="models/yolov8m.pt", device="cpu", conf_threshold=0.35
-    ):
+    def __init__(self, model_name="models/yolov8m.pt", conf_threshold=0.35):
         ov_dir = model_name.replace(".pt", "_openvino_model")
         if not os.path.exists(ov_dir):
             yolo_model = YOLO(model_name)
@@ -133,7 +122,6 @@ class YoloDetectionOpenVINO:
             )
             ov_dir = export_path
         self.model = YOLO(ov_dir)
-        self.device = device
         self.conf_threshold = conf_threshold
 
     def infer(self, image: np.ndarray, return_boxes: bool = True):
@@ -144,7 +132,6 @@ class YoloDetectionOpenVINO:
         results = self.model.predict(
             source=image,
             conf=self.conf_threshold,
-            device=self.device,
             imgsz=(H, W),
             verbose=False,
         )
@@ -166,9 +153,6 @@ class YoloDetectionOpenVINO:
                     boxes.append((name, conf, (center_x, center_y)))
         return boxes
 
-    def __call__(self, image: np.ndarray, return_boxes: bool = True):
-        return self.infer(image, return_boxes)
-
 
 class YoloDetectionMain:
     def __init__(
@@ -179,11 +163,11 @@ class YoloDetectionMain:
     ):
         cpu_type = self._detect_cpu()
         if cpu_type == "Apple Silicon":
-            self.model = YoloDetectionCoreML(model_name, device, conf_threshold)
+            self.model = YoloDetectionCoreML(model_name, conf_threshold)
         elif cpu_type == "Unknown":
             self.model = YoloDetection(model_name, device, conf_threshold)
         else:
-            self.model = YoloDetectionOpenVINO(model_name, device, conf_threshold)
+            self.model = YoloDetectionOpenVINO(model_name, conf_threshold)
 
     def _detect_cpu(self):
         info = cpuinfo.get_cpu_info()
@@ -200,8 +184,5 @@ class YoloDetectionMain:
 
         return "Unknown"
 
-    def infer(self, image: np.ndarray, return_boxes: bool = True):
-        return self.model(image, return_boxes)
-
     def __call__(self, image: np.ndarray, return_boxes: bool = True):
-        return self.infer(image, return_boxes)
+        return self.model.infer(image, return_boxes)
