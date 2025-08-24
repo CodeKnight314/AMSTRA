@@ -1,5 +1,13 @@
-ultralytics
+psutil
+rich
 torch
-numpy<2
-tqdm
+numpy
+opencv-python
+scipy
+scikit-image
+ultralytics
+py-cpuinfo
+coremltools
 matplotlib
+tqdm
+openvino-dev
