@@ -45,6 +45,26 @@ The AMSTRA server architecture offloads heavy computation from the Mavic 2 Pro t
   - Write **navigation data** (K, R, t) to JSON.
   - Write **tracking data** (detections + tracks) to separate JSON.
 
+### Server-Client Dashboard
+
+To make the server simpler to use and invariant to user's experience, `server.py` incorporates simple `rich`-based dashboard for easy viewing of incoming streams.
+
+![Server Dashboard](resources/images/Ground%20Station%20Dashboard.png)
+
+In addition, the autonomous and manual webot controller scripts, `mavic2pro_geotag_auto.py` and `mavic2pro_geotag.py` respectively, have simple print based UI or control hints. Rich-based dashboard could not be incorporated since it could not be displayed via Webots simulator's std output.
+
+<p align="center">
+  <img src="resources/images/Drone Controller Dashboard.png" alt="AMSTRA Controller Dashboard">
+  <br>
+  <em>AMSTRA Drone Controller Dashboard (Autonomous Mode).</em>
+</p>
+
+<p align="center">
+  <img src="resources/images/Drone Controller Dashboard Manual.png" alt="AMSTRA Manual Controller">
+  <br>
+  <em>AMSTRA Drone Controller Dashboard (Manual Mode).</em>
+</p>
+
 ## SORT-based Tracking
 
 AMSTRA employs a **SORT-based tracking manager** built on top of an extended **Kalman Filter** framework. This tracker maintains consistent identities for objects across frames, even when detections are missing.
@@ -82,16 +102,14 @@ The triangulation subsystem attempts to recover **3D spatial positions** of trac
 
 - **Outputs**
   - Produces a JSON log of 3D points associated with tracked bounding boxes.
-  - Can periodically trigger BA to refine accumulated 3D structure over time.
-  - Results are inherently noisy due to the **monocular depth ambiguity**, but demonstrate relative positioning and motion trends.
 
 ## Limitations
 
 While AMSTRA benefits from real-time processing via separation of computing responsibilities, the inherent limitations prevent AMSTRA from performing more robustly in challenging circumstances. Specifically, Mavic 2 Pro drones feature **monocular camera streams**, which limits triangulation accuracy and SORT-based tracking management.
 
 - If the camera or drone rotates the view too abruptly, SORT attempts to predict how bounding boxes (bboxes) should move to compensate.
-- Without reliable **depth estimation**, predictions often drift or break down.
-- Monocular input cannot easily resolve scale or distance in real time, leading to inconsistent adjustments by the SORT manager.
+- Without reliable **depth estimation**, triangulation predictions often drift or break down.
+- Monocular input cannot easily resolve scale or distance in real time, leading to unrealistic adjustments by the SORT manager and triangulation results with oscillating magnitudes.
 
 ### Key Challenges
 
