@@ -6,7 +6,20 @@ import struct, socket, time, threading
 from queue import Queue, Full, Empty
 import random
 import math
+import os
 import json
+from enum import Enum
+
+
+class Status(Enum):
+    UNVISITED = "Unvisited"
+    APPROACHING = "Approaching"
+    VISITED = "Visited"
+
+
+class ControlMode(Enum):
+    MANUAL = "Manual"
+    AUTO = "Auto"
 
 
 def get_camera_intrinsic(height: float, width: float, fov: float):
@@ -16,6 +29,40 @@ def get_camera_intrinsic(height: float, width: float, fov: float):
     fy = fx
     matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
     return matrix
+
+
+def wrap_to_pi(angle):
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def pos_to_waypoints(current_x, current_y, waypts):
+    pts_dist = []
+    for i, (pts_x, pts_y) in waypts:
+        pts_dist.append(dist(current_x, current_y, pts_x, pts_y))
+    return pts_dist
+
+
+def load_waypoints():
+    path = "waypoints.txt"
+    waypoints = []
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            for line in f:
+                data = line.strip().split(", ")
+                try:
+                    x = int(data[0])
+                    y = int(data[1])
+                except ValueError:
+                    print(f"Malformed data could not be read for line: {line}")
+                    continue
+                waypoints.append((x, y))
+    else:
+        waypoints = [(0, -180), (0, 180), (-180, 0), (180, 0)]
+    return waypoints
+
+
+def dist(x1, y1, x2, y2):
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
 
 
 class FrameClient:
@@ -143,6 +190,52 @@ def transmission_delay(min_ms: int = 15, max_ms: int = 25):
     time.sleep(sleep_duration_sec)
 
 
+def clear_terminal():
+    if os.name == "nt":
+        _ = os.system("cls")
+    else:
+        _ = os.system("clear")
+
+
+def print_manual_controls():
+    clear_terminal()
+    print("\n" + "="*60)
+    print("DRONE CONTROLLER - MANUAL MODE")
+    print("="*60)
+    print("Controls:")
+    print("- WASD: move (W/S=fwd/back, A/D=strafe)")
+    print("- Q/E: yaw left/right")
+    print("- R/F: altitude up/down")
+    print("- Arrow keys: control camera (Left/Right=yaw, Up/Down=pitch)")
+    print("- P: Toggle to AUTO mode")
+    print("="*60)
+
+
+def print_waypoints_status(waypoints, waypoints_travel, current_x, current_y, frame_count, control_mode):
+    if frame_count % 60 != 0 or control_mode != ControlMode.AUTO:
+        return
+    clear_terminal()
+    print("\n" + "="*60)
+    print("DRONE CONTROLLER - AUTO MODE")
+    print("="*60)
+    print(f"{'Waypoint':<15} {'Status':<15} {'Distance':<10}")
+    print("-" * 50)
+    
+    approaching_waypoint = None
+    for i, ((wx, wy), status_val) in enumerate(zip(waypoints, waypoints_travel)):
+        distance = dist(current_x, current_y, wx, wy)
+        print(f"({wx:<6}, {wy:<6}) {status_val.value:<15} {distance:<10.2f}")
+        
+        if status_val == Status.APPROACHING:
+            approaching_waypoint = (wx, wy)
+    
+    print("\nInfo:", end=" ")
+    if approaching_waypoint:
+        print(f"Drone is approaching Waypoint: {approaching_waypoint}")
+    print("- P: Toggle to MANUAL mode")
+    print("="*60)
+
+
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 
@@ -211,19 +304,20 @@ while robot.step(timestep) != -1:
     if robot.getTime() > 1.0:
         break
 
-print("Controls:")
-print("- WASD: move (W/S=fwd/back, A/D=strafe)")
-print("- Q/E: yaw left/right")
-print("- R/F: altitude up/down")
-print("- Arrow keys: control camera (Left/Right=yaw, Up/Down=pitch)")
-
 k_vertical_thrust = 68.5
 k_vertical_offset = 0.6
 k_vertical_p = 3.0
 k_roll_p = 50.0
 k_pitch_p = 30.0
 
+control_mode = ControlMode.MANUAL
 target_altitude = 1.0
+
+waypoints = load_waypoints()
+curr_waypoint_idx = 0
+waypoints_travel = [Status.UNVISITED for i in range(len(waypoints))]
+if waypoints:
+    waypoints_travel[curr_waypoint_idx] = Status.APPROACHING
 
 cam_pitch_offset = 0.0
 cam_yaw_offset = 0.0
@@ -231,6 +325,11 @@ cam_pitch_step = 0.005
 cam_yaw_step = 0.005
 cam_pitch_limit = 0.5
 cam_yaw_limit = 1.6
+
+last_p_key_time = 0.0
+p_key_debounce_delay = 0.5
+
+print_manual_controls()
 
 while robot.step(timestep) != -1:
     now = robot.getTime()
@@ -242,46 +341,34 @@ while robot.step(timestep) != -1:
     frame_bgr = camera_frame_bgr()
     if frame_bgr is not None:
         pos = gps.getValues()
-        t = np.array(pos).reshape(
-            3,
-        )
+        t = np.array(pos).reshape(3,)
 
-        R_cam_yaw = np.array(
-            [
-                [np.cos(cam_yaw_offset), -np.sin(cam_yaw_offset), 0],
-                [np.sin(cam_yaw_offset), np.cos(cam_yaw_offset), 0],
-                [0, 0, 1],
-            ]
-        )
+        R_cam_yaw = np.array([
+            [np.cos(cam_yaw_offset), -np.sin(cam_yaw_offset), 0],
+            [np.sin(cam_yaw_offset), np.cos(cam_yaw_offset), 0],
+            [0, 0, 1],
+        ])
 
-        R_cam_pitch = np.array(
-            [
-                [np.cos(cam_pitch_offset), 0, np.sin(cam_pitch_offset)],
-                [0, 1, 0],
-                [-np.sin(cam_pitch_offset), 0, np.cos(cam_pitch_offset)],
-            ]
-        )
+        R_cam_pitch = np.array([
+            [np.cos(cam_pitch_offset), 0, np.sin(cam_pitch_offset)],
+            [0, 1, 0],
+            [-np.sin(cam_pitch_offset), 0, np.cos(cam_pitch_offset)],
+        ])
 
         R_cam = R_cam_yaw @ R_cam_pitch
 
         roll, pitch, yaw = imu.getRollPitchYaw()
-        Rz = np.array(
-            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
-        )
-        Ry = np.array(
-            [
-                [np.cos(pitch), 0, np.sin(pitch)],
-                [0, 1, 0],
-                [-np.sin(pitch), 0, np.cos(pitch)],
-            ]
-        )
-        Rx = np.array(
-            [
-                [1, 0, 0],
-                [0, np.cos(roll), -np.sin(roll)],
-                [0, np.sin(roll), np.cos(roll)],
-            ]
-        )
+        Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+        Ry = np.array([
+            [np.cos(pitch), 0, np.sin(pitch)],
+            [0, 1, 0],
+            [-np.sin(pitch), 0, np.cos(pitch)],
+        ])
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(roll), -np.sin(roll)],
+            [0, np.sin(roll), np.cos(roll)],
+        ])
         R = Rz @ Ry @ Rx @ R_cam
         t = -1 * R.T @ t
         R = R.T
@@ -291,7 +378,6 @@ while robot.step(timestep) != -1:
         height = camera.getHeight()
 
         K = get_camera_intrinsic(height, width, fov)
-
         sender.send_frame(frame_bgr, K, R, t)
 
     led_state = int(now) % 2
@@ -309,26 +395,44 @@ while robot.step(timestep) != -1:
 
     key = keyboard.getKey()
     while key != -1:
-        if key in (ord("W"), ord("w")):
-            pitch_disturbance = -2.0
-        elif key in (ord("S"), ord("s")):
-            pitch_disturbance = 2.0
-        elif key in (ord("A"), ord("a")):
-            roll_disturbance = 1.0
-        elif key in (ord("D"), ord("d")):
-            roll_disturbance = -1.0
-        elif key in (ord("Q"), ord("q")):
-            yaw_disturbance = 2.0
-        elif key in (ord("E"), ord("e")):
-            yaw_disturbance = -2.0
-        elif key in (ord("R"), ord("r")):
-            target_altitude += 0.05
-            print(f"target altitude: {target_altitude:.2f} m")
-        elif key in (ord("F"), ord("f")):
-            target_altitude -= 0.05
-            print(f"target altitude: {target_altitude:.2f} m")
+        if key in (ord("P"), ord("p")):
+            if now - last_p_key_time > p_key_debounce_delay:
+                last_p_key_time = now
+                if control_mode == ControlMode.MANUAL:
+                    control_mode = ControlMode.AUTO
+                    target_altitude = 20.0
+                    if waypoints:
+                        curr_waypoint_idx = 0
+                        waypoints_travel = [Status.UNVISITED for i in range(len(waypoints))]
+                        waypoints_travel[curr_waypoint_idx] = Status.APPROACHING
+                    clear_terminal()
+                    print(f"\n*** SWITCHED TO {control_mode.value.upper()} MODE ***")
+                    time.sleep(0.1)
+                else:
+                    control_mode = ControlMode.MANUAL
+                    target_altitude = 1.0
+                    print_manual_controls()
+        elif control_mode == ControlMode.MANUAL:
+            if key in (ord("W"), ord("w")):
+                pitch_disturbance = -2.0
+            elif key in (ord("S"), ord("s")):
+                pitch_disturbance = 2.0
+            elif key in (ord("A"), ord("a")):
+                roll_disturbance = 1.0
+            elif key in (ord("D"), ord("d")):
+                roll_disturbance = -1.0
+            elif key in (ord("Q"), ord("q")):
+                yaw_disturbance = 2.0
+            elif key in (ord("E"), ord("e")):
+                yaw_disturbance = -2.0
+            elif key in (ord("R"), ord("r")):
+                target_altitude += 0.05
+                print(f"target altitude: {target_altitude:.2f} m")
+            elif key in (ord("F"), ord("f")):
+                target_altitude -= 0.05
+                print(f"target altitude: {target_altitude:.2f} m")
 
-        elif key == Keyboard.UP:
+        if key == Keyboard.UP:
             cam_pitch_offset = clamp(
                 cam_pitch_offset - cam_pitch_step, -cam_pitch_limit, cam_pitch_limit
             )
@@ -347,13 +451,34 @@ while robot.step(timestep) != -1:
 
         key = keyboard.getKey()
 
+    if control_mode == ControlMode.AUTO and waypoints:
+        target_altitude = 20.0
+        pitch_disturbance = -2.0
+        
+        wx, wy = waypoints[curr_waypoint_idx]
+        theta_desired = math.atan2(wy - _y, wx - _x)
+        yaw_disturbance = wrap_to_pi(theta_desired - _yaw)
+
+        if dist(_x, _y, wx, wy) < 8.5:
+            waypoints_travel[curr_waypoint_idx] = Status.VISITED
+            curr_waypoint_idx = (curr_waypoint_idx + 1) % len(waypoints)
+            waypoints_travel[curr_waypoint_idx] = Status.APPROACHING
+            wx, wy = waypoints[curr_waypoint_idx]
+
+        frame_count = int(now * 1000 / timestep)
+        print_waypoints_status(waypoints, waypoints_travel, _x, _y, frame_count, control_mode)
+
     pitch_input = (
         k_pitch_p * clamp(pitch - initial_pitch, -1.0, 1.0) + gy + pitch_disturbance
     )
     roll_input = (
         k_roll_p * clamp(roll - initial_roll, -1.0, 1.0) + gx + roll_disturbance
     )
-    yaw_input = yaw_disturbance
+
+    if control_mode == ControlMode.AUTO:
+        yaw_input = yaw_disturbance * 0.35
+    else:
+        yaw_input = yaw_disturbance
 
     clamped_diff_alt = clamp(target_altitude - altitude + k_vertical_offset, -1.0, 1.0)
     vertical_input = k_vertical_p * pow(clamped_diff_alt, 3.0)
