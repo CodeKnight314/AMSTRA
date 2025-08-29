@@ -2,238 +2,10 @@ import cv2
 from controller import Robot, Keyboard
 from math import pow
 import numpy as np
-import struct, socket, time, threading
-from queue import Queue, Full, Empty
-import random
+import time
 import math
-import os
-import json
-from enum import Enum
-
-
-class Status(Enum):
-    UNVISITED = "Unvisited"
-    APPROACHING = "Approaching"
-    VISITED = "Visited"
-
-
-class ControlMode(Enum):
-    MANUAL = "Manual"
-    AUTO = "Auto"
-
-
-def get_camera_intrinsic(height: float, width: float, fov: float):
-    cx = (width - 1) / 2
-    cy = (height - 1) / 2
-    fx = width / (2 * math.tan(fov / 2))
-    fy = fx
-    matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-    return matrix
-
-
-def wrap_to_pi(angle):
-    return (angle + math.pi) % (2 * math.pi) - math.pi
-
-
-def pos_to_waypoints(current_x, current_y, waypts):
-    pts_dist = []
-    for i, (pts_x, pts_y) in waypts:
-        pts_dist.append(dist(current_x, current_y, pts_x, pts_y))
-    return pts_dist
-
-
-def load_waypoints():
-    path = "waypoints.txt"
-    waypoints = []
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            for line in f:
-                data = line.strip().split(", ")
-                try:
-                    x = int(data[0])
-                    y = int(data[1])
-                except ValueError:
-                    print(f"Malformed data could not be read for line: {line}")
-                    continue
-                waypoints.append((x, y))
-    else:
-        waypoints = [(0, -180), (0, 180), (-180, 0), (180, 0)]
-    return waypoints
-
-
-def dist(x1, y1, x2, y2):
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-
-class FrameClient:
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        timeout: float,
-        jpeg_quality: int,
-        max_queue: int = 100,
-        drop_policy: str = "drop_oldest",
-    ):
-        assert 0 <= jpeg_quality <= 100
-        assert drop_policy in ("drop_oldest", "drop_newest")
-        self.address = (host, port)
-        self.timeout = timeout
-        self.quality = jpeg_quality
-        self.q = Queue(maxsize=max_queue)
-        self.drop_policy = drop_policy
-        self._stop = threading.Event()
-        self.sock = None
-        self._connect()
-
-        self._tx = threading.Thread(target=self._tx_loop, daemon=True)
-        self._tx.start()
-
-    def send_frame(self, bgr: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray):
-        while True:
-            try:
-                batch = (bgr, K, R, t)
-                self.q.put_nowait(batch)
-                break
-            except Full:
-                if self.drop_policy == "drop_oldest":
-                    try:
-                        self.q.get_nowait()
-                    except Empty:
-                        pass
-                else:
-                    return
-
-    def close(self):
-        self._stop.set()
-        try:
-            self.q.put_nowait(None)
-        except Full:
-            pass
-        try:
-            if self.sock:
-                self.sock.close()
-        finally:
-            self.sock = None
-
-    def _connect(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(self.timeout)
-        s.connect(self.address)
-        s.settimeout(None)
-        self.sock = s
-        print(f"[client] connected to {self.address[0]}:{self.address[1]}")
-
-    def _tx_loop(self):
-        while not self._stop.is_set():
-            transmission_delay()
-            item = self.q.get()
-            if item is None:
-                break
-            bgr, k, r, t = item
-            ok, enc = cv2.imencode(
-                ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-            )
-            if not ok:
-                continue
-            data = enc.tobytes()
-            if len(data) == 0 or len(data) > 50_000_000:
-                continue
-            header = struct.pack("!I", len(data))
-            try:
-                self.sock.sendall(header)
-                self.sock.sendall(data)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                try:
-                    print("TX error → reconnecting…")
-                    time.sleep(0.25)
-                    self._connect()
-                    self.sock.sendall(header)
-                    self.sock.sendall(data)
-                except Exception:
-                    pass
-
-            metadata = {
-                "K": k.flatten().tolist(),
-                "R": r.flatten().tolist(),
-                "T": t.flatten().tolist(),
-            }
-
-            meta_bytes = json.dumps(metadata).encode("utf-8")
-            meta_header = struct.pack("!I", len(meta_bytes))
-            try:
-                self.sock.sendall(meta_header)
-                self.sock.sendall(meta_bytes)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                try:
-                    print("TX error → reconnecting...")
-                    time.sleep(1)
-                    self._connect()
-                    self.sock.sendall(meta_header)
-                    self.sock.sendall(meta_bytes)
-                except Exception:
-                    pass
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def transmission_delay(min_ms: int = 15, max_ms: int = 25):
-    sleep_duration_ms = random.randint(min_ms, max_ms)
-    sleep_duration_sec = sleep_duration_ms / 1000
-    time.sleep(sleep_duration_sec)
-
-
-def clear_terminal():
-    if os.name == "nt":
-        _ = os.system("cls")
-    else:
-        _ = os.system("clear")
-
-
-def print_manual_controls():
-    clear_terminal()
-    print("\n" + "="*60)
-    print("DRONE CONTROLLER - MANUAL MODE")
-    print("="*60)
-    print("Controls:")
-    print("- WASD: move (W/S=fwd/back, A/D=strafe)")
-    print("- Q/E: yaw left/right")
-    print("- R/F: altitude up/down")
-    print("- Arrow keys: control camera (Left/Right=yaw, Up/Down=pitch)")
-    print("- P: Toggle to AUTO mode")
-    print("="*60)
-
-
-def print_waypoints_status(waypoints, waypoints_travel, current_x, current_y, frame_count, control_mode):
-    if frame_count % 60 != 0 or control_mode != ControlMode.AUTO:
-        return
-    clear_terminal()
-    print("\n" + "="*60)
-    print("DRONE CONTROLLER - AUTO MODE")
-    print("="*60)
-    print(f"{'Waypoint':<15} {'Status':<15} {'Distance':<10}")
-    print("-" * 50)
-    
-    approaching_waypoint = None
-    for i, ((wx, wy), status_val) in enumerate(zip(waypoints, waypoints_travel)):
-        distance = dist(current_x, current_y, wx, wy)
-        print(f"({wx:<6}, {wy:<6}) {status_val.value:<15} {distance:<10.2f}")
-        
-        if status_val == Status.APPROACHING:
-            approaching_waypoint = (wx, wy)
-    
-    print("\nInfo:", end=" ")
-    if approaching_waypoint:
-        print(f"Drone is approaching Waypoint: {approaching_waypoint}")
-    print("- P: Toggle to MANUAL mode")
-    print("="*60)
+from utils import *
+from frame_client import FrameClient
 
 
 robot = Robot()
@@ -341,34 +113,46 @@ while robot.step(timestep) != -1:
     frame_bgr = camera_frame_bgr()
     if frame_bgr is not None:
         pos = gps.getValues()
-        t = np.array(pos).reshape(3,)
+        t = np.array(pos).reshape(
+            3,
+        )
 
-        R_cam_yaw = np.array([
-            [np.cos(cam_yaw_offset), -np.sin(cam_yaw_offset), 0],
-            [np.sin(cam_yaw_offset), np.cos(cam_yaw_offset), 0],
-            [0, 0, 1],
-        ])
+        R_cam_yaw = np.array(
+            [
+                [np.cos(cam_yaw_offset), -np.sin(cam_yaw_offset), 0],
+                [np.sin(cam_yaw_offset), np.cos(cam_yaw_offset), 0],
+                [0, 0, 1],
+            ]
+        )
 
-        R_cam_pitch = np.array([
-            [np.cos(cam_pitch_offset), 0, np.sin(cam_pitch_offset)],
-            [0, 1, 0],
-            [-np.sin(cam_pitch_offset), 0, np.cos(cam_pitch_offset)],
-        ])
+        R_cam_pitch = np.array(
+            [
+                [np.cos(cam_pitch_offset), 0, np.sin(cam_pitch_offset)],
+                [0, 1, 0],
+                [-np.sin(cam_pitch_offset), 0, np.cos(cam_pitch_offset)],
+            ]
+        )
 
         R_cam = R_cam_yaw @ R_cam_pitch
 
         roll, pitch, yaw = imu.getRollPitchYaw()
-        Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
-        Ry = np.array([
-            [np.cos(pitch), 0, np.sin(pitch)],
-            [0, 1, 0],
-            [-np.sin(pitch), 0, np.cos(pitch)],
-        ])
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll), np.cos(roll)],
-        ])
+        Rz = np.array(
+            [[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]]
+        )
+        Ry = np.array(
+            [
+                [np.cos(pitch), 0, np.sin(pitch)],
+                [0, 1, 0],
+                [-np.sin(pitch), 0, np.cos(pitch)],
+            ]
+        )
+        Rx = np.array(
+            [
+                [1, 0, 0],
+                [0, np.cos(roll), -np.sin(roll)],
+                [0, np.sin(roll), np.cos(roll)],
+            ]
+        )
         R = Rz @ Ry @ Rx @ R_cam
         t = -1 * R.T @ t
         R = R.T
@@ -403,7 +187,9 @@ while robot.step(timestep) != -1:
                     target_altitude = 20.0
                     if waypoints:
                         curr_waypoint_idx = 0
-                        waypoints_travel = [Status.UNVISITED for i in range(len(waypoints))]
+                        waypoints_travel = [
+                            Status.UNVISITED for i in range(len(waypoints))
+                        ]
                         waypoints_travel[curr_waypoint_idx] = Status.APPROACHING
                     clear_terminal()
                     print(f"\n*** SWITCHED TO {control_mode.value.upper()} MODE ***")
@@ -454,7 +240,7 @@ while robot.step(timestep) != -1:
     if control_mode == ControlMode.AUTO and waypoints:
         target_altitude = 20.0
         pitch_disturbance = -2.0
-        
+
         wx, wy = waypoints[curr_waypoint_idx]
         theta_desired = math.atan2(wy - _y, wx - _x)
         yaw_disturbance = wrap_to_pi(theta_desired - _yaw)
@@ -466,7 +252,9 @@ while robot.step(timestep) != -1:
             wx, wy = waypoints[curr_waypoint_idx]
 
         frame_count = int(now * 1000 / timestep)
-        print_waypoints_status(waypoints, waypoints_travel, _x, _y, frame_count, control_mode)
+        print_waypoints_status(
+            waypoints, waypoints_travel, _x, _y, frame_count, control_mode
+        )
 
     pitch_input = (
         k_pitch_p * clamp(pitch - initial_pitch, -1.0, 1.0) + gy + pitch_disturbance
