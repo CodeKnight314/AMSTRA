@@ -5,7 +5,7 @@ import math
 supervisor = Supervisor()
 timestep = int(supervisor.getBasicTimeStep())
 
-N_CARS = 15
+N_CARS = 60
 Z_FIXED = 0.31
 
 XMIN, XMAX = -180.0, 180.0
