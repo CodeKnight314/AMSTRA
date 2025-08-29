@@ -17,11 +17,11 @@ logging.basicConfig(
 
 
 class TriangulationF2FModule:
-    def __init__(self, k: np.ndarray):
+    def __init__(self, maxlen: int, k: np.ndarray = np.eye(3, dtype=np.float32)):
         self.k = k
         self.orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        self._buffer = deque(maxlen=100)
+        self._buffer = deque(maxlen=maxlen)
 
     def __call__(self, frame1, R1, t1, frame2, R2, t2, bboxes):
         return self.infer(frame1, R1, t1, frame2, R2, t2, bboxes)
@@ -51,7 +51,7 @@ class TriangulationF2FModule:
     ):
         self.k = K
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_mask = self._make_mask(frame, bboxes)
+        frame_mask = self._make_mask(frame.shape, bboxes)
         keypoints, descriptors = self.orb.detectAndCompute(frame, frame_mask)
 
         if len(keypoints) < 8 or descriptors is None:
@@ -75,6 +75,8 @@ class TriangulationF2FModule:
         self._buffer.append(transition)
 
     def _feature_match(self, kp1, des1, kp2, des2):
+        if des1 is None or des2 is None:
+            return [], []
         matches = self.bf.match(des1, des2)
         matches = sorted(matches, key=lambda x: x.distance)
 
@@ -117,12 +119,16 @@ class TriangulationF2FModule:
 
         pts4D = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
         X3D = (pts4D[:3] / pts4D[3]).T
+        X3D = self._filter(candidate1, candidate2, X3D)
 
         bbox_to_pts = {i: [] for i in range(len(bboxes))}
+        if X3D.shape[0] == 0:
+            return bbox_to_pts
+
         for pt1, pt2, X in zip(pts1, pts2, X3D):
             for i, bbox in enumerate(bboxes):
                 if self._is_in_bbox(pt1, [bbox]) and self._is_in_bbox(pt2, [bbox]):
-                    bbox_to_pts[i].append(X)
+                    bbox_to_pts[i].append(X.tolist())
 
         return bbox_to_pts
 
@@ -134,6 +140,30 @@ class TriangulationF2FModule:
                 return True
 
         return False
+
+    def _cheirality(self, f1, f2, X):
+        X = X.reshape(-1, 3)
+        z1 = (f1["R"] @ X.T + f1["t"]).T[:, 2]
+        z2 = (f2["R"] @ X.T + f2["t"]).T[:, 2]
+        valid_cheirality = (z1 > 0) & (z2 > 0)
+        return valid_cheirality
+
+    def _parallax(self, f1, f2, X):
+        c1 = -f1["R"].T @ f1["t"]
+        c2 = -f2["R"].T @ f2["t"]
+        r1 = X - c1.reshape(1, 3)
+        r2 = X - c2.reshape(1, 3)
+
+        cosang = np.sum(r1 * r2, axis=1) / (
+            np.linalg.norm(r1, axis=1) * np.linalg.norm(r2, axis=1) + 1e-12
+        )
+
+        angles = np.degrees(np.arccos(np.clip(cosang, -1, 1)))
+        valid_parallax = angles > 5.0
+        return valid_parallax
+
+    def _filter(self, f1, f2, X):
+        return X[self._cheirality(f1, f2, X) & self._parallax(f1, f2, X)]
 
 
 class TriangulationBAModule:
@@ -433,12 +463,16 @@ class TriangulationBAModule:
         return len(self._buffer)
 
 
-def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
+def triangulation_postprocess(
+    cv_path: str, mp4_path: str, output_path: str, maxlen: int, verbose: bool = False
+):
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(output_path, exist_ok=True)
-    logging.info("Starting Postprocessing...")
+    if verbose:
+        logging.info("Starting Postprocessing...")
     tri_ba_module = TriangulationBAModule(maxlen=maxlen)
-    logging.info("Triangulation Bundle Adjustment Module initialized.")
+    if verbose:
+        logging.info("Triangulation Bundle Adjustment Module initialized.")
 
     points3d_json_path = os.path.join(output_path, f"stream_{time_str}_points3d.json")
     firstOutputEntry = True
@@ -451,19 +485,27 @@ def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
     cap = cv2.VideoCapture(mp4_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if not cap.isOpened():
-        logging.error("Could not open video file.")
+        if verbose:
+            logging.error("Could not open video file.")
         return
 
     frame_idx = 0
     initialized = False
-    for frame_idx in tqdm(range(total_frames), desc="Processing frames", leave=False):
+
+    if verbose:
+        pbar = tqdm(range(total_frames), desc="Processing frames", leave=False)
+    else:
+        pbar = range(total_frames)
+
+    for frame_idx in pbar:
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_data = cv_data[frame_idx]["data"]
         if not frame_data:
-            logging.warning(f"No CV data found for frame {frame_idx}")
+            if verbose:
+                logging.warning(f"No CV data found for frame {frame_idx}")
             continue
 
         tri_ba_module.insert(
@@ -475,7 +517,8 @@ def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
         )
 
         if initialized and frame_idx % 50 == 0:
-            logging.info(f"Inference Triggered at Frame Idx: {frame_idx}")
+            if verbose:
+                logging.info(f"Inference Triggered at Frame Idx: {frame_idx}")
             points3d = tri_ba_module.infer(
                 np.array(frame_data["K"]),
                 frame,
@@ -492,7 +535,8 @@ def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
                 firstOutputEntry = False
 
         if len(tri_ba_module) == maxlen and not initialized:
-            logging.info("Initializing_3D_points")
+            if verbose:
+                logging.info("Initializing_3D_points")
             tri_ba_module.initialize_3D_points()
             initialized = True
             points3d = tri_ba_module.infer(
@@ -509,6 +553,74 @@ def triangulation_postprocess(cv_path, mp4_path, output_path, maxlen):
                     f.write(",\n")
                 json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
                 firstOutputEntry = False
+
+    with open(points3d_json_path, "a") as f:
+        f.write("\n]")
+
+
+def triangulation_f2f_process(
+    cv_path: str,
+    mp4_path: str,
+    output_path: str,
+    maxlen: int = 60,
+    verbose: bool = True,
+):
+    time_str = datetime.now().strftime("%Y%m&d_%H%M%S")
+    os.makedirs(output_path, exist_ok=True)
+    if verbose:
+        logging.info("Starting Postprocessing...")
+    tri_f2f = TriangulationF2FModule(maxlen=maxlen)
+    if verbose:
+        logging.info("Triangulation Frame2Frame Module initiated")
+
+    points3d_json_path = os.path.join(output_path, f"stream_{time_str}.json")
+    firstOutputEntry = True
+
+    with open(points3d_json_path, "w") as f:
+        f.write("[\n")
+
+    with open(cv_path, "r") as f:
+        cv_data = json.load(f)
+
+    cap = cv2.VideoCapture(mp4_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened():
+        if verbose:
+            logging.error("Could not open video file.")
+        return
+
+    if verbose:
+        pbar = tqdm(range(total_frames), desc="Processing Frames")
+    else:
+        pbar = range(total_frames)
+
+    for frame_idx in pbar:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_data = cv_data[frame_idx]["data"]
+        if not frame_data:
+            if verbose:
+                logging.warning(f"No CV data found for frame {frame_idx}")
+            continue
+
+        if len(tri_f2f._buffer) > 2:
+            points3d = tri_f2f.infer(frame_data["bboxes"])
+
+            with open(points3d_json_path, "a") as f:
+                if not firstOutputEntry:
+                    f.write(",\n")
+                json.dump({"frame_idx": frame_idx, "data": points3d}, f, indent=4)
+                firstOutputEntry = False
+
+        tri_f2f.insert(
+            np.array(frame_data["K"]),
+            frame,
+            np.array(frame_data["R"]),
+            np.array(frame_data["t"]),
+            frame_data["bboxes"],
+        )
 
     with open(points3d_json_path, "a") as f:
         f.write("\n]")
