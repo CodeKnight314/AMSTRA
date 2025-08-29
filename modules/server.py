@@ -62,7 +62,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 def recv_frame(sock: socket.socket) -> np.ndarray:
     header = recv_exact(sock, 4)
     (length,) = struct.unpack("!I", header)
-    if length == 0 or length > 50_000_000:
+    if length == MIN_RECV_SIZE or length > MAX_RECV_SIZE:
         raise ValueError(f"Bad frame length: {length}")
     payload = recv_exact(sock, length)
     arr = np.frombuffer(payload, dtype=np.uint8)
@@ -75,7 +75,7 @@ def recv_frame(sock: socket.socket) -> np.ndarray:
 def recv_metadata(sock: socket.socket) -> List[np.ndarray]:
     header = recv_exact(sock, 4)
     (length,) = struct.unpack("!I", header)
-    if length == 0 or length > 50_000_000:
+    if length == MIN_RECV_SIZE or length > MAX_RECV_SIZE:
         raise ValueError(f"Bad frame length: {length}")
     payload = recv_exact(sock, length)
     metadata = json.loads(payload.decode("utf-8"))
@@ -104,7 +104,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         output_path = os.path.join(output_path, time_str)
         os.makedirs(output_path, exist_ok=True)
 
-        yolo = YoloDetectionMain(conf_threshold=CONF)
+        yolo = YoloDetectionMain(model_name="models/yolov8l.pt", conf_threshold=CONF)
         sort_manager = SORTTrackManager()
 
         json_path = os.path.join(output_path, f"stream_{time_str}.json")
@@ -133,7 +133,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
 
         start_timestamp = time.time()
 
-        q = queue.Queue(maxsize=1e6)
+        q = queue.Queue(maxsize=FRAME_LONG_BUFFER_SIZE)
         stop_sentinel = object()
 
         def recv_loop():
@@ -165,20 +165,20 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         def worker_loop():
             firstNavEntry = True
             firstOutputEntry = True
-            frame_buffer = deque(maxlen=1000)
+            frame_buffer = deque(maxlen=FRAME_SHORT_BUFFER_SIZE)
             outputs = []
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             label_mp4 = cv2.VideoWriter(
                 label_mp4_path,
                 fourcc,
                 FPS,
-                (640, 480),
+                (CAMERA_WIDTH, CAMERA_HEIGHT),
             )
             raw_mp4 = cv2.VideoWriter(
                 raw_mp4_path,
                 fourcc,
                 FPS,
-                (640, 480),
+                (CAMERA_WIDTH, CAMERA_HEIGHT),
             )
 
             while True:
@@ -189,7 +189,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                 else:
                     raw_mp4.write(frame)
 
-                force_detection = idx % 5 == 0
+                force_detection = idx % MIN_SWEEP_INTERVAL == 0
 
                 motion = (
                     True
@@ -273,9 +273,13 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                     if class_name not in CLASS_FILTER:
                         continue
 
-                    color = (0, 255, 0)
-
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1),
+                        (x2, y2),
+                        DETECTION_BOX_COLOR,
+                        DETECTION_BOX_THICKNESS,
+                    )
 
                     label = f"{class_name} ID:{track_id} Predict: {output['kalman']}"
                     coords_label = ""
@@ -294,7 +298,7 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
                         frame,
                         (x1, y1 - total_h),
                         (x1 + total_w, y1),
-                        color,
+                        DETECTION_BOX_COLOR,
                         -1,
                     )
 
