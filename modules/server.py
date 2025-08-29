@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 from yolo_detector import YoloDetectionMain
 from sort_tracking import SORTTrackManager
-from triangulation import triangulation_postprocess
+from triangulation import triangulation_f2f_process
 from dashboard import Dashboard
 import argparse
 import os
@@ -344,8 +344,8 @@ def process_stream_async(output_path: str, conn: socket.socket, addr: str):
         with open(cvdata_json_path, "a") as f:
             f.write("\n]")
         dashboard.update_stream(stream_id, status="Postprocess", cpu=0, queue=0)
-        triangulation_postprocess(
-            cvdata_json_path, raw_mp4_path, output_path, maxlen=120
+        triangulation_f2f_process(
+            cvdata_json_path, raw_mp4_path, output_path, maxlen=120, verbose=False
         )
         dashboard.update_stream(stream_id, status="Disconnected", cpu=0, queue=0)
         clear_terminal()
