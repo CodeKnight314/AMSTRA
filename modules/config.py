@@ -4,7 +4,7 @@ THRESHOLD_MEAN = 0.02
 THRESHOLD_HIST = 0.15
 THRESHOLD_SSIM = 0.90
 
-CONF = 0.75
+CONF = 0.55
 N_BASE = 10
 FPS = 60
 
@@ -22,7 +22,7 @@ MIN_RECV_SIZE = 0
 MAX_RECV_SIZE = 50_000_000
 
 # For short-term memory to use @ motion-gate
-FRAME_SHORT_BUFFER_SIZE = 1e2
+FRAME_SHORT_BUFFER_SIZE = int(1e2)
 # For long-term memory to prevent server gets overwhelmed
 FRAME_LONG_BUFFER_SIZE = 1e6
 
